@@ -1,0 +1,6 @@
+audiobooks/
+uploads/
+metadata/
+config/
+.claude/
+.vscode/

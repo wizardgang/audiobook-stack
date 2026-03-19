@@ -1,0 +1,38 @@
+services:
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    container_name: audiobookshelf
+    ports:
+      - 13378:80
+    volumes:
+      - ./audiobooks:/audiobooks
+      - ./metadata:/config
+      - ./config:/metadata
+    environment:
+      - TZ=Africa/Nairobi
+    restart: unless-stopped
+
+  abogen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: abogen-cpu:local
+    container_name: abogen
+    ports:
+      - 8808:8808
+    volumes:
+      # Use forward slashes for Docker paths even on Windows
+      - ./uploads:/data/uploads
+      - ./audiobooks:/data/outputs
+    environment:
+      - ABOGEN_PORT=8808
+      - TZ=Africa/Nairobi
+    # UNCOMMENT BELOW ONLY IF YOU HAVE NVIDIA GPU & TOOLKIT INSTALLED
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
