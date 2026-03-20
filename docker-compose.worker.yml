@@ -1,0 +1,56 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Remote Worker Node
+#
+# Deploy this on any additional server that has abogen installed.
+# Point REDIS_URL at the main server's Redis.
+# Mount or sync the shared output directory (NFS, SFTP, or rclone).
+#
+# Usage:
+#   REDIS_URL=redis://192.168.1.10:6379 \
+#   WORKER_ID=remote-1 \
+#   OUTPUT_DIR=/mnt/shared/outputs \
+#   docker compose -f docker-compose.worker.yml up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  abogen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: abogen-cpu:local
+    container_name: abogen-worker
+    ports:
+      - "${ABOGEN_BIND_IP:-0.0.0.0}:${ABOGEN_PORT:-8808}:${ABOGEN_PORT:-8808}"
+    volumes:
+      - ${CHUNKS_DIR:-./chunks}:/data/uploads
+      - ${OUTPUT_DIR:-./outputs}:/data/outputs
+    environment:
+      - ABOGEN_PORT=${ABOGEN_PORT:-8808}
+      - TZ=${TZ:-Africa/Nairobi}
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: pipeline-worker
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${PROMETHEUS_PORT:-8000}:${PROMETHEUS_PORT:-8000}"
+    environment:
+      - REDIS_URL=${REDIS_URL:?Set REDIS_URL to the main server Redis}
+      - ABOGEN_HOST=http://abogen:8808
+      - WORKER_ID=${WORKER_ID:-remote-1}
+      - PROMETHEUS_PORT=${PROMETHEUS_PORT:-8000}
+      - OUTPUT_DIR=/outputs
+      - TTS_TIMEOUT_S=${TTS_TIMEOUT_S:-600}
+      - TZ=${TZ:-Africa/Nairobi}
+    volumes:
+      - ${CHUNKS_DIR:-./chunks}:/chunks # must be accessible to this node
+      - ${OUTPUT_DIR:-./outputs}:/outputs        # must be shared back to main server
+    depends_on:
+      - abogen
+

@@ -6,25 +6,23 @@ FROM python:3.12-slim AS builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone the source
-RUN git clone --depth=1 https://github.com/denizsafak/abogen.git /build
+# Copy the locally bundled abogen source instead of running git clone
+COPY abogen_src /build
 
-# Install CPU-only PyTorch first so pip won't pull in the CUDA wheels (~700 MB).
 RUN pip install --no-cache-dir \
         torch torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cpu
 
-# Install abogen; keep torch on the CPU index so the CUDA wheel isn't pulled in
+
 RUN pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cpu \
         . && \
     pip uninstall -y PyQt6 PyQt6-Qt6 PyQt6-sip PyQt6-WebEngine PyQt6-WebEngine-Qt6 2>/dev/null; true
 
-# ── Stage 2: Runtime ────────────────────────────────────────────────────────────
+
 FROM python:3.12-slim AS runtime
 
 LABEL org.opencontainers.image.title="abogen-cpu" \
@@ -66,3 +64,4 @@ EXPOSE 8808
 
 # Use the web-only entry point – no PyQt6 import anywhere in this call path
 CMD ["abogen-web"]
+

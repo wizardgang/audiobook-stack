@@ -1,6 +1,11 @@
+.env
+docker
+docker.pub
+inbox/
+chunks/
+outputs/
 audiobooks/
-uploads/
-metadata/
-config/
-.claude/
-.vscode/
+abs-config/
+abs-metadata/
+__pycache__/
+*.pyc
