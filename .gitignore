@@ -7,6 +7,5 @@ outputs/
 audiobooks/
 abs-config/
 abs-metadata/
-abogen_src/
 __pycache__/
 *.pyc
