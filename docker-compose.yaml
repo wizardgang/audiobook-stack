@@ -1,0 +1,143 @@
+# ─────────────────────────────────────────────
+# Shared networks & volumes
+# ─────────────────────────────────────────────
+networks:
+  pipeline:
+    driver: bridge
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+# ─────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────
+services:
+
+  # ── 1. REDIS (job queue + state store) ──────
+  redis:
+    image: redis:7-alpine
+    container_name: pipeline-redis
+    restart: unless-stopped
+    ports:
+      - 10.0.0.1:6379:6379
+    volumes:
+      - redis-data:/data
+    networks:
+      - pipeline
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── 2. WATCHER (detects new PDFs) ───────────
+  watcher:
+    build:
+      context: ./watcher
+      dockerfile: Dockerfile
+    container_name: pipeline-watcher
+    restart: unless-stopped
+    environment:
+      - TZ=Africa/Nairobi
+      - REDIS_URL=redis://redis:6379
+      - WATCH_DIR=/watch
+      - POLL_INTERVAL=5          # seconds between polls (fallback)
+    volumes:
+      - ./inbox:/watch            # drop PDFs here
+      - ./chunks:/chunks          # split chunks land here
+    networks:
+      - pipeline
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── 3. ORCHESTRATOR (PDF splitter) ──────────
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: pipeline-orchestrator
+    restart: unless-stopped
+    environment:
+      - TZ=Africa/Nairobi
+      - REDIS_URL=redis://redis:6379
+      - CHUNKS_DIR=/chunks
+      - CHUNK_SIZE_CHARS=3000    # chars per TTS chunk (~3 min audio)
+    volumes:
+      - ./chunks:/chunks
+      - ./inbox:/watch
+    networks:
+      - pipeline
+    depends_on:
+      redis:
+        condition: service_healthy
+  
+  merger:
+    build:
+      context: ./merger
+      dockerfile: Dockerfile
+    container_name: pipeline-merger
+    restart: unless-stopped
+    environment:
+      - TZ=Africa/Nairobi
+      - REDIS_URL=redis://redis:6379
+      - OUTPUT_DIR=/outputs
+      - AUDIOBOOK_DIR=/audiobooks
+    volumes:
+      - ./outputs:/outputs        # per-chunk MP3s arrive here
+      - ./audiobooks:/audiobooks  # final merged books land here
+    networks:
+      - pipeline
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    container_name: audiobookshelf
+    ports:
+      - "10.0.0.1:13378:80"
+    volumes:
+      - ./audiobooks:/audiobooks
+      - ./abs-metadata:/config
+      - ./abs-config:/metadata
+    environment:
+      - TZ=Africa/Nairobi
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pipeline-prometheus
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pipeline-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+  
+

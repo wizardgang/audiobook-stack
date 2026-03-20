@@ -1,0 +1,12 @@
+.env
+docker
+docker.pub
+inbox/
+chunks/
+outputs/
+audiobooks/
+abs-config/
+abs-metadata/
+abogen_src/
+__pycache__/
+*.pyc

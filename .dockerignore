@@ -1,0 +1,15 @@
+.git
+.venv
+.test_venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+outputs
+chunks
+models
+tts-node/chunks
+tts-node/outputs
+data/
+*.db
+*.sqlite3
