@@ -11,18 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-# pymupdf is the package name for the 'fitz' module
-RUN pip install --no-cache-dir \
-    redis \
-    pymupdf \
-    requests
+# ── Layer 1: dependencies (cached until requirements.txt changes) ─────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY orchestrator.py .
+# ── Layer 2: source (only invalidates layers below this line) ─────────────────
+COPY orchestrator.py invalidate_chunks.py ./
 
-# Create the chunks directory and ensure it exists
-RUN mkdir -p /chunks
-RUN mkdir -p /watch
+RUN mkdir -p /chunks /watch
 
-# Run the orchestrator
 CMD ["python", "orchestrator.py"]

@@ -1,0 +1,42 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NFS volume override for docker-compose.worker.yml
+#
+# Use this on Windows (Docker Desktop) or any node where you don't want to
+# pre-mount NFS on the host — Docker mounts it directly inside its Linux VM.
+#
+# Required .env vars:
+#   NFS_SERVER=10.0.0.1
+#   NFS_OUTPUT_PATH=/mnt/pipeline-outputs/output
+#   NFS_CHUNKS_PATH=/mnt/pipeline-outputs/chunks
+#
+# Usage:
+#   docker compose -f docker-compose.worker.yml -f docker-compose.worker.nfs.yml up -d --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+volumes:
+  pipeline-outputs:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=${NFS_SERVER:?Set NFS_SERVER in .env},rw,nfsvers=4,soft,timeo=30
+      device: ":${NFS_OUTPUT_PATH:?Set NFS_OUTPUT_PATH in .env}"
+
+  pipeline-chunks:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=${NFS_SERVER},rw,nfsvers=4,soft,timeo=30
+      device: ":${NFS_CHUNKS_PATH:?Set NFS_CHUNKS_PATH in .env}"
+
+services:
+  abogen:
+    volumes:
+      - pipeline-chunks:/data/uploads
+      - pipeline-outputs:/data/outputs
+
+  worker:
+    volumes:
+      - pipeline-chunks:/chunks
+      - pipeline-outputs:/outputs

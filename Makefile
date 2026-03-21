@@ -4,7 +4,7 @@ EXCLUDES = --exclude=inbox --exclude=outputs --exclude=audiobooks --exclude=.git
 USER ?= root
 DEST ?= /root/tts-node
 
-.PHONY: up down logs status reset worker-remote inject sync watch-sync
+.PHONY: up down logs status reset worker-remote inject sync watch-sync retry books invalidate-chunks
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 
@@ -36,6 +36,10 @@ queue:
 
 # ── Remote workers ────────────────────────────────────────────────────────────
 # Usage: make worker-remote HOST=192.168.1.20 WORKER_ID=remote-1 [USER=deploy] [DEST=/opt/tts-node]
+# On the remote node, choose a volume override:
+#   Linux (pre-mounted NFS):  docker compose -f docker-compose.worker.yml up -d --build
+#   Windows (NFS via Docker): docker compose -f docker-compose.worker.yml -f docker-compose.worker.nfs.yml up -d --build
+#   Windows (SMB/CIFS):       docker compose -f docker-compose.worker.yml -f docker-compose.worker.smb.yml up -d --build
 worker-remote:
 	@test -n "$(HOST)" || (echo "Usage: make worker-remote HOST=... WORKER_ID=..."; exit 1)
 	rsync -av -e "ssh -i $(KEY) -o StrictHostKeyChecking=no" $(EXCLUDES) \
@@ -74,6 +78,38 @@ pause:
 resume:
 	@echo "Resuming pipeline cluster..."
 	@docker exec pipeline-redis redis-cli del pipeline:state
+
+# ── Retry failed merge ────────────────────────────────────────────────────
+# Usage: make retry BOOK_ID=<book_id>
+retry:
+	@test -n "$(BOOK_ID)" || (echo "Usage: make retry BOOK_ID=<id>"; exit 1)
+	@TITLE=$$(docker exec pipeline-redis redis-cli hget "book:$(BOOK_ID)" title); \
+	TOTAL=$$(docker exec pipeline-redis redis-cli hget "book:$(BOOK_ID)" total_chunks); \
+	test -n "$$TITLE" || (echo "Error: book:$(BOOK_ID) not found in Redis"; exit 1); \
+	docker exec pipeline-redis redis-cli hset "book:$(BOOK_ID)" status queued error "" merge_started_at ""; \
+	docker exec pipeline-redis redis-cli lpush pipeline:done \
+	  "{\"book_id\":\"$(BOOK_ID)\",\"title\":\"$$TITLE\",\"total\":$$TOTAL,\"out_dir\":\"/outputs/$(BOOK_ID)\"}"; \
+	echo "Merge re-triggered for book $(BOOK_ID) ($$TITLE, $$TOTAL chunks)"
+
+# ── Invalidate / re-queue chunks ─────────────────────────────────────────
+# Usage:
+#   make invalidate-chunks BOOK_ID=<id>               # re-queue all error chunks
+#   make invalidate-chunks BOOK_ID=<id> CHUNKS=all    # re-queue every chunk
+#   make invalidate-chunks BOOK_ID=<id> CHUNKS=0,5,23 # re-queue specific indices
+invalidate-chunks:
+	@test -n "$(BOOK_ID)" || (echo "Usage: make invalidate-chunks BOOK_ID=<id> [CHUNKS=all|errors|0,5,23]"; exit 1)
+	docker exec pipeline-orchestrator python /app/invalidate_chunks.py "$(BOOK_ID)" "$(or $(CHUNKS),errors)"
+
+# ── List all books ────────────────────────────────────────────────────────
+books:
+	@echo "=== Books in pipeline ==="
+	@for id in $$(docker exec pipeline-redis redis-cli smembers pipeline:seen_files); do \
+		STATUS=$$(docker exec pipeline-redis redis-cli hget "book:$$id" status); \
+		TITLE=$$(docker exec pipeline-redis redis-cli hget "book:$$id" title); \
+		DONE=$$(docker exec pipeline-redis redis-cli hget "book:$$id" done_chunks); \
+		TOTAL=$$(docker exec pipeline-redis redis-cli hget "book:$$id" total_chunks); \
+		echo "  [$$STATUS] $$TITLE ($$DONE/$$TOTAL) — ID: $$id"; \
+	done
 
 # Continuous sync every 10 seconds
 watch-sync:

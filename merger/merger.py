@@ -4,7 +4,9 @@ import logging
 import subprocess
 import redis
 import json
+import time
 from pathlib import Path
+from prometheus_client import start_http_server, Counter, Histogram, Gauge
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,12 +17,30 @@ log = logging.getLogger(__name__)
 REDIS_URL     = os.environ.get("REDIS_URL",      "redis://localhost:6379")
 OUTPUT_DIR    = Path(os.environ.get("OUTPUT_DIR",    "/outputs"))
 AUDIOBOOK_DIR = Path(os.environ.get("AUDIOBOOK_DIR", "/audiobooks"))
+CHUNKS_DIR    = Path(os.environ.get("CHUNKS_DIR",    "/chunks"))
 KEEP_CHUNKS   = os.environ.get("KEEP_CHUNKS", "false").lower() == "true"
 
 # Output format: "mp3" or "m4b"
 OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "m4b")
 
 QUEUE_DONE = "pipeline:done"
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+MERGER_TOTAL          = Counter('pipeline_merger_merges_total',
+                                'Merge jobs completed', ['status'])
+MERGER_DURATION       = Histogram('pipeline_merger_duration_seconds',
+                                  'Total merge job duration end-to-end',
+                                  buckets=[30, 60, 120, 300, 600, 1200, 1800, 3600])
+MERGER_FFMPEG_SECS    = Histogram('pipeline_merger_ffmpeg_seconds',
+                                  'ffmpeg encode/concat wall time',
+                                  buckets=[5, 15, 30, 60, 120, 300, 600, 1200])
+MERGER_CHUNK_WAIT     = Histogram('pipeline_merger_chunk_wait_seconds',
+                                  'Time spent waiting for chunk files to arrive (NFS lag)',
+                                  buckets=[0, 5, 15, 30, 60, 120, 300, 600])
+MERGER_CHUNKS_TOTAL   = Counter('pipeline_merger_chunks_merged_total',
+                                'Total individual MP3 chunks merged into audiobooks')
+MERGER_QUEUE_DEPTH    = Gauge('pipeline_merger_queue_depth',
+                               'Current merge queue depth')
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -36,7 +56,8 @@ def build_concat_list(chunk_dir: Path, total: int) -> Path:
     for idx in range(total):
         chunk = chunk_dir / f"chunk_{idx:04d}.mp3"
         if not chunk.exists():
-            raise FileNotFoundError(f"Missing chunk: {chunk}")
+            log.warning("Missing chunk %d, skipping in concatenation...", idx)
+            continue
         # ffmpeg concat format requires escaped paths
         escaped = str(chunk).replace("'", "'\\''")
         lines.append(f"file '{escaped}'")
@@ -58,7 +79,6 @@ def get_duration_ms(filepath: Path) -> int:
 
 
 def build_ffmetadata(chunk_dir: Path, total: int, title: str) -> Path:
-    import json
     meta_json_file = chunk_dir / "meta.json"
     chunk_meta = []
     if meta_json_file.exists():
@@ -72,6 +92,9 @@ def build_ffmetadata(chunk_dir: Path, total: int, title: str) -> Path:
     
     for idx in range(total):
         chunk_file = chunk_dir / f"chunk_{idx:04d}.mp3"
+        if not chunk_file.exists():
+            continue
+
         duration = get_duration_ms(chunk_file)
         
         c_title = "Chapter"
@@ -151,10 +174,12 @@ def process_merge(raw: str):
     chunk_dir = Path(job["out_dir"])
 
     log.info("Merging book %s — %s (%d chunks)", book_id[:8], title, total)
-    set_book_state(book_id, status="merging", merge_started_at=time.time())
+    job_start = time.time()
+    set_book_state(book_id, status="merging", merge_started_at=job_start)
 
-    # Wait up to 60 s for any straggling chunk files to land
-    for attempt in range(12):
+    # Wait up to 10 minutes for all chunk MP3s to land on the shared volume
+    wait_start = time.time()
+    for attempt in range(120):
         missing = [
             chunk_dir / f"chunk_{i:04d}.mp3"
             for i in range(total)
@@ -162,12 +187,19 @@ def process_merge(raw: str):
         ]
         if not missing:
             break
-        log.info("  Waiting for %d chunks to arrive...", len(missing))
+        if attempt % 6 == 0:  # log every 30s
+            log.info("  Waiting for %d/%d chunks to arrive... (%ds elapsed)",
+                     len(missing), total, attempt * 5)
         time.sleep(5)
     else:
-        log.error("  Timed out waiting for chunks — aborting merge")
+        log.error("  Timed out waiting for chunks — %d still missing after 10 min: %s",
+                  len(missing), [p.name for p in missing[:5]])
+        MERGER_CHUNK_WAIT.observe(time.time() - wait_start)
+        MERGER_TOTAL.labels(status="failed").inc()
         set_book_state(book_id, status="error", error="chunk files missing at merge time")
         return
+
+    MERGER_CHUNK_WAIT.observe(time.time() - wait_start)
 
     # Build ffmpeg concat list and chapter metadata map
     try:
@@ -175,6 +207,7 @@ def process_merge(raw: str):
         ffmeta_path = build_ffmetadata(chunk_dir, total, title)
     except FileNotFoundError as exc:
         log.error("  %s", exc)
+        MERGER_TOTAL.labels(status="failed").inc()
         set_book_state(book_id, status="error", error=str(exc))
         return
 
@@ -183,16 +216,20 @@ def process_merge(raw: str):
     book_out_dir = AUDIOBOOK_DIR / safe_title
     book_out_dir.mkdir(parents=True, exist_ok=True)
 
-    ext     = OUTPUT_FORMAT
+    ext      = OUTPUT_FORMAT
     out_path = book_out_dir / f"{safe_title}.{ext}"
 
+    ffmpeg_start = time.time()
     try:
         if ext in ("m4b", "m4a"):
             merge_to_m4b(concat_file, ffmeta_path, out_path, title)
         else:
             merge_to_mp3(concat_file, ffmeta_path, out_path, title)
+        MERGER_FFMPEG_SECS.observe(time.time() - ffmpeg_start)
     except RuntimeError as exc:
         log.error("  Merge failed: %s", exc)
+        MERGER_TOTAL.labels(status="failed").inc()
+        MERGER_DURATION.observe(time.time() - job_start)
         set_book_state(book_id, status="error", error=str(exc))
         return
 
@@ -200,13 +237,15 @@ def process_merge(raw: str):
     if not KEEP_CHUNKS:
         try:
             shutil.rmtree(chunk_dir)
-            # Also remove text chunks dir under /chunks/<book_id>
-            from pathlib import Path as P
-            txt_dir = P("/chunks") / book_id
+            txt_dir = CHUNKS_DIR / book_id
             if txt_dir.exists():
                 shutil.rmtree(txt_dir)
         except Exception as exc:
             log.warning("  Cleanup warning: %s", exc)
+
+    MERGER_TOTAL.labels(status="success").inc()
+    MERGER_CHUNKS_TOTAL.inc(total)
+    MERGER_DURATION.observe(time.time() - job_start)
 
     set_book_state(book_id,
         status="complete",
@@ -218,9 +257,18 @@ def process_merge(raw: str):
 
 def main():
     AUDIOBOOK_DIR.mkdir(parents=True, exist_ok=True)
+
+    prom_port = int(os.environ.get("PROMETHEUS_PORT", "8002"))
+    start_http_server(prom_port)
+    log.info("Prometheus metrics on port %d", prom_port)
     log.info("Merger ready, consuming %s", QUEUE_DONE)
 
     while True:
+        try:
+            MERGER_QUEUE_DEPTH.set(r.llen(QUEUE_DONE))
+        except Exception:
+            pass
+
         result = r.brpop(QUEUE_DONE, timeout=5)
         if result is None:
             continue

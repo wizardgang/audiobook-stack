@@ -1,0 +1,65 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMB/CIFS volume override for docker-compose.worker.yml
+#
+# Use this on Windows (Docker Desktop) nodes where the shared storage is
+# exposed as a Samba/CIFS share instead of NFS.
+# Docker mounts the share inside its Linux VM — no Windows CIFS client needed.
+#
+# Share layout expected on the server (10.0.0.8 / PublicShare):
+#   \\10.0.0.8\PublicShare\outputs   ← per-chunk MP3s written by workers
+#   \\10.0.0.8\PublicShare\chunks    ← text chunks written by orchestrator
+#
+# Required .env vars:
+#   SMB_SERVER=10.0.0.8
+#   SMB_SHARE=PublicShare
+#   SMB_USER=guest          # or your SMB username
+#   SMB_PASSWORD=           # leave blank for guest/anonymous
+#
+# Usage:
+#   docker compose -f docker-compose.worker.yml -f docker-compose.worker.smb.yml up -d --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+volumes:
+  # Both volumes mount the SHARE ROOT — not subdirectories within it.
+  # Mounting a non-existent subdirectory path silently succeeds but leaves _data
+  # empty, causing the "utime: no such file or directory" error on container start.
+  #
+  # OUTPUT_DIR and CHUNKS_DIR use subdirectories within the share root.
+  # The outputs/ and chunks/ subdirs must already exist on the server — the guest
+  # account may not have permission to create them on first run.
+  pipeline-outputs:
+    driver: local
+    driver_opts:
+      type: cifs
+      # uid=0,gid=0 : Docker volume daemon is root — must match to avoid utime failure
+      # noperm      : skip client-side permission checks
+      # nobrl       : disable byte-range locking (required by most Samba servers)
+      o: "addr=${SMB_SERVER:?Set SMB_SERVER in .env},username=${SMB_USER:-guest},password=${SMB_PASSWORD:-},uid=0,gid=0,file_mode=0777,dir_mode=0777,iocharset=utf8,vers=3.0,noperm,nobrl"
+      device: "//${SMB_SERVER}/${SMB_SHARE:?Set SMB_SHARE in .env}"
+
+  pipeline-chunks:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "addr=${SMB_SERVER},username=${SMB_USER:-guest},password=${SMB_PASSWORD:-},uid=0,gid=0,file_mode=0777,dir_mode=0777,iocharset=utf8,vers=3.0,noperm,nobrl"
+      device: "//${SMB_SERVER}/${SMB_SHARE}"
+
+services:
+  abogen:
+    volumes:
+      - pipeline-chunks:/data/uploads
+      - pipeline-outputs:/data/outputs
+    environment:
+      - OUTPUT_DIR=/data/outputs/outputs
+      - UPLOAD_DIR=/data/uploads/chunks
+
+  worker:
+    volumes:
+      - pipeline-chunks:/chunks-root
+      - pipeline-outputs:/outputs-root
+      # worker-spool is inherited from docker-compose.worker.yml — no override needed
+    environment:
+      - OUTPUT_DIR=/outputs-root/outputs
+      - CHUNKS_DIR=/chunks-root/chunks

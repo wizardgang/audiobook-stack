@@ -1,0 +1,5 @@
+redis
+pymupdf
+requests
+openai
+prometheus-client

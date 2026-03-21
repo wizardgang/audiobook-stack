@@ -1,0 +1,507 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Real-time monitoring for the distributed TTS audiobook pipeline — workers, queue, orchestrator, merger and AI services.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100, "title": "📊 Pipeline Overview", "type": "row" },
+
+    {
+      "id": 1, "type": "stat", "title": "Books Completed",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pipeline_merger_merges_total{status=\"success\"}) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "auto"},
+      "fieldConfig": {"defaults": {"color": {"fixedColor": "green", "mode": "fixed"}, "unit": "short"}}
+    },
+    {
+      "id": 2, "type": "stat", "title": "Books Failed",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pipeline_merger_merges_total{status=\"failed\"}) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "unit": "short",
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+    },
+    {
+      "id": 3, "type": "stat", "title": "TTS Queue Depth",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "pipeline_queue_tts_depth or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "unit": "short",
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "red", "value": 500}]}}}
+    },
+    {
+      "id": 4, "type": "stat", "title": "Active Workers",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "count(abogen_worker_status == 1) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"fixedColor": "blue", "mode": "fixed"}, "unit": "short"}}
+    },
+    {
+      "id": 5, "type": "stat", "title": "Chunks/min (fleet)",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(rate(abogen_worker_jobs_total{status=\"success\"}[5m])) * 60 or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"fixedColor": "purple", "mode": "fixed"}, "unit": "short", "decimals": 1}}
+    },
+    {
+      "id": 6, "type": "stat", "title": "Total Chunks Done",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(abogen_worker_jobs_total{status=\"success\"}) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"fixedColor": "text", "mode": "fixed"}, "unit": "short"}}
+    },
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "id": 101, "title": "⚙️ Worker Fleet", "type": "row" },
+
+    {
+      "id": 10, "type": "timeseries", "title": "Chunk Throughput by Worker (chunks/sec)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(abogen_worker_jobs_total{status=\"success\", worker_id=~\"$worker\"}[2m])", "legendFormat": "{{worker_id}}", "refId": "A"},
+        {"expr": "sum(rate(abogen_worker_jobs_total{status=\"success\"}[2m]))", "legendFormat": "TOTAL", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 8}},
+        "overrides": [{"matcher": {"id": "byName", "options": "TOTAL"}, "properties": [{"id": "custom.lineWidth", "value": 3}, {"id": "color", "value": {"fixedColor": "white", "mode": "fixed"}}]}]}
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "TTS API Latency per Worker (p50 / p95)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (worker_id, le) (rate(abogen_worker_api_latency_seconds_bucket{worker_id=~\"$worker\"}[5m])))", "legendFormat": "p50 {{worker_id}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (worker_id, le) (rate(abogen_worker_api_latency_seconds_bucket{worker_id=~\"$worker\"}[5m])))", "legendFormat": "p95 {{worker_id}}", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 5}}}
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Job Processing Duration (chunk start → MP3 written)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (worker_id, le) (rate(abogen_worker_job_processing_duration_seconds_bucket{worker_id=~\"$worker\"}[5m])))", "legendFormat": "p50 {{worker_id}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (worker_id, le) (rate(abogen_worker_job_processing_duration_seconds_bucket{worker_id=~\"$worker\"}[5m])))", "legendFormat": "p95 {{worker_id}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (worker_id, le) (rate(abogen_worker_job_processing_duration_seconds_bucket{worker_id=~\"$worker\"}[5m])))", "legendFormat": "p99 {{worker_id}}", "refId": "C"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 5}}}
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Worker Status (0=Idle · 1=Processing · 2=Error)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "abogen_worker_status{worker_id=~\"$worker\"}", "legendFormat": "{{worker_id}}", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "max": 2, "custom": {"lineWidth": 2, "fillOpacity": 20},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}, {"color": "green", "value": 1}, {"color": "red", "value": 2}]}}}
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Worker Heartbeat Age (seconds since last activity)",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "time() - abogen_worker_heartbeat_timestamp{worker_id=~\"$worker\"}", "legendFormat": "{{worker_id}}", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 30}, {"color": "red", "value": 120}]},
+        "color": {"mode": "thresholds"}}}
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Redis Reconnects by Worker",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "increase(abogen_worker_redis_reconnects_total{worker_id=~\"$worker\"}[15m])", "legendFormat": "{{worker_id}}", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 10},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}}
+    },
+
+    {
+      "id": 16, "type": "timeseries", "title": "Current Job Elapsed Time per Worker (live)",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "(time() - abogen_worker_job_start_timestamp_seconds{worker_id=~\"$worker\"}) and (abogen_worker_status{worker_id=~\"$worker\"} == 1)", "legendFormat": "{{worker_id}}", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 10},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 120}, {"color": "red", "value": 300}]},
+        "color": {"mode": "thresholds"}}}
+    },
+    {
+      "id": 17, "type": "timeseries", "title": "Last Chunk Duration per Worker (seconds)",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "abogen_worker_job_completion_timestamp_seconds{worker_id=~\"$worker\"} - abogen_worker_job_start_timestamp_seconds{worker_id=~\"$worker\"}", "legendFormat": "{{worker_id}}", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 8}}}
+    },
+    {
+      "id": 18, "type": "timeseries", "title": "Chunks/min per Worker",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 34},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(abogen_worker_jobs_total{status=\"success\", worker_id=~\"$worker\"}[2m]) * 60", "legendFormat": "{{worker_id}}", "refId": "A"},
+        {"expr": "sum(rate(abogen_worker_jobs_total{status=\"success\"}[2m])) * 60", "legendFormat": "TOTAL", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 8}},
+        "overrides": [{"matcher": {"id": "byName", "options": "TOTAL"}, "properties": [{"id": "custom.lineWidth", "value": 3}, {"id": "color", "value": {"fixedColor": "white", "mode": "fixed"}}]}]}
+    },
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "id": 102, "title": "📬 Queue & Throughput", "type": "row" },
+
+    {
+      "id": 20, "type": "timeseries", "title": "TTS Queue Depth Over Time",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "pipeline_queue_tts_depth or vector(0)", "legendFormat": "TTS queue", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "single"}},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 20},
+        "color": {"fixedColor": "blue", "mode": "fixed"}}}
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "Chunks Enqueued vs Completed (rate/sec)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(pipeline_orchestrator_chunks_enqueued_total[2m])", "legendFormat": "Enqueued", "refId": "A"},
+        {"expr": "sum(rate(abogen_worker_jobs_total{status=\"success\"}[2m]))", "legendFormat": "Completed OK", "refId": "B"},
+        {"expr": "sum(rate(abogen_worker_jobs_total{status=\"failed\"}[2m]))", "legendFormat": "Failed", "refId": "C"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 5}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Failed"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Completed OK"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Enqueued"}, "properties": [{"id": "color", "value": {"fixedColor": "blue", "mode": "fixed"}}]}
+        ]}
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "Chunk Failure Rate by Worker",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 49},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(abogen_worker_jobs_total{status=\"failed\", worker_id=~\"$worker\"}[5m])", "legendFormat": "{{worker_id}}", "refId": "A"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 15},
+        "color": {"mode": "palette-classic"}}}
+    },
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 55},
+      "id": 103, "title": "🔀 Orchestrator", "type": "row" },
+
+    {
+      "id": 30, "type": "timeseries", "title": "Books Extracted (rate/min)",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 56},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(pipeline_orchestrator_books_total{status=\"extracted\"}[10m]) * 60", "legendFormat": "Extracted", "refId": "A"},
+        {"expr": "rate(pipeline_orchestrator_books_total{status=\"failed\"}[10m]) * 60", "legendFormat": "Failed", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "id": 31, "type": "timeseries", "title": "Chapters: Processed vs Skipped",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 56},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(pipeline_orchestrator_chapters_total{status=\"processed\"}[5m])", "legendFormat": "Processed", "refId": "A"},
+        {"expr": "rate(pipeline_orchestrator_chapters_total{status=\"skipped\"}[5m])", "legendFormat": "Skipped", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 8}}}
+    },
+    {
+      "id": 32, "type": "timeseries", "title": "PDF Extraction Duration (p50 / p95)",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 56},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(pipeline_orchestrator_extraction_seconds_bucket[10m]))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(pipeline_orchestrator_extraction_seconds_bucket[10m]))", "legendFormat": "p95", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 33, "type": "stat", "title": "Watchdog Resurrections",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 64},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pipeline_orchestrator_watchdog_resurrections_total) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "unit": "short",
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}}}
+    },
+    {
+      "id": 34, "type": "timeseries", "title": "Watchdog Resurrections (rate)",
+      "gridPos": {"h": 4, "w": 18, "x": 6, "y": 64},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(pipeline_orchestrator_watchdog_resurrections_total[15m])", "legendFormat": "Ghost chunks rescued", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 15},
+        "color": {"fixedColor": "orange", "mode": "fixed"}}}
+    },
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 68},
+      "id": 104, "title": "📼 Merger", "type": "row" },
+
+    {
+      "id": 40, "type": "stat", "title": "Total Merges Complete",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 69},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pipeline_merger_merges_total{status=\"success\"}) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"color": {"fixedColor": "green", "mode": "fixed"}, "unit": "short"}}
+    },
+    {
+      "id": 41, "type": "stat", "title": "Merge Failures",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 69},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pipeline_merger_merges_total{status=\"failed\"}) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "unit": "short",
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+    },
+    {
+      "id": 42, "type": "stat", "title": "Total Chunks Merged",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 69},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pipeline_merger_chunks_merged_total) or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 43, "type": "timeseries", "title": "Merge Duration (p50 / p95)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 69},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(pipeline_merger_duration_seconds_bucket[30m]))", "legendFormat": "p50 total", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(pipeline_merger_duration_seconds_bucket[30m]))", "legendFormat": "p95 total", "refId": "B"},
+        {"expr": "histogram_quantile(0.50, rate(pipeline_merger_ffmpeg_seconds_bucket[30m]))", "legendFormat": "p50 ffmpeg", "refId": "C"},
+        {"expr": "histogram_quantile(0.95, rate(pipeline_merger_ffmpeg_seconds_bucket[30m]))", "legendFormat": "p95 ffmpeg", "refId": "D"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 5}}}
+    },
+    {
+      "id": 44, "type": "timeseries", "title": "Chunk File Wait Time (NFS/volume lag indicator)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 77},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(pipeline_merger_chunk_wait_seconds_bucket[30m]))", "legendFormat": "p50 wait", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(pipeline_merger_chunk_wait_seconds_bucket[30m]))", "legendFormat": "p95 wait", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, rate(pipeline_merger_chunk_wait_seconds_bucket[30m]))", "legendFormat": "p99 wait", "refId": "C"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 30}, {"color": "red", "value": 120}]},
+        "color": {"mode": "thresholds"}}}
+    },
+    {
+      "id": 45, "type": "timeseries", "title": "Merge Queue Depth",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 77},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "pipeline_merger_queue_depth or vector(0)", "legendFormat": "Pending merges", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 20},
+        "color": {"fixedColor": "purple", "mode": "fixed"}}}
+    },
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 85},
+      "id": 105, "title": "🤖 AI Services (OpenRouter)", "type": "row" },
+
+    {
+      "id": 50, "type": "timeseries", "title": "AI API Calls/sec (normalize vs chunk)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 86},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(pipeline_orchestrator_ai_calls_total{status=\"success\"}[2m])", "legendFormat": "{{type}} OK", "refId": "A"},
+        {"expr": "rate(pipeline_orchestrator_ai_calls_total{status=~\"fallback|error\"}[2m])", "legendFormat": "{{type}} fallback/err", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 8}}}
+    },
+    {
+      "id": 51, "type": "timeseries", "title": "AI API Latency (p50 / p95 by type)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 86},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (type, le) (rate(pipeline_orchestrator_ai_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{type}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (type, le) (rate(pipeline_orchestrator_ai_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{type}}", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 52, "type": "timeseries", "title": "AI Normalize Latency per Chunk (p50 / p95)",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 94},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(pipeline_orchestrator_ai_normalize_seconds_bucket[5m]))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(pipeline_orchestrator_ai_normalize_seconds_bucket[5m]))", "legendFormat": "p95", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 53, "type": "stat", "title": "AI Fallback Rate",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 94},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(rate(pipeline_orchestrator_ai_calls_total{status=~\"fallback|error\"}[15m])) / sum(rate(pipeline_orchestrator_ai_calls_total[15m])) * 100 or vector(0)", "instant": true, "refId": "A"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1,
+        "color": {"mode": "thresholds"},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}]}}}
+    },
+
+    { "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 100},
+      "id": 106, "title": "⚠️ Errors & Reliability", "type": "row" },
+
+    {
+      "id": 60, "type": "timeseries", "title": "Worker Error Logs (warnings + errors)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 101},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rate(abogen_worker_logs_total{level=\"error\", worker_id=~\"$worker\"}[5m])", "legendFormat": "ERROR {{worker_id}}", "refId": "A"},
+        {"expr": "rate(abogen_worker_logs_total{level=\"warning\", worker_id=~\"$worker\"}[5m])", "legendFormat": "WARN {{worker_id}}", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi", "sort": "desc"}},
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 10}},
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": "ERROR.*"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byRegexp", "options": "WARN.*"}, "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]}
+        ]}
+    },
+    {
+      "id": 61, "type": "timeseries", "title": "Failed vs Successful Chunks (cumulative)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 101},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum(abogen_worker_jobs_total{status=\"success\"})", "legendFormat": "Success (total)", "refId": "A"},
+        {"expr": "sum(abogen_worker_jobs_total{status=\"failed\"})", "legendFormat": "Failed (total)", "refId": "B"}
+      ],
+      "options": {"tooltip": {"mode": "multi"}},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2, "fillOpacity": 5}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Failed (total)"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Success (total)"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]}
+        ]}
+    },
+    {
+      "id": 62, "type": "timeseries", "title": "Orchestrator Extraction Duration",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 109},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(pipeline_orchestrator_chunking_seconds_bucket[10m]))", "legendFormat": "p50 chunking", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(pipeline_orchestrator_chunking_seconds_bucket[10m]))", "legendFormat": "p95 chunking", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 63, "type": "bargauge", "title": "Per-Worker: Success vs Failure (all time)",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 109},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (worker_id) (abogen_worker_jobs_total{status=\"success\", worker_id=~\"$worker\"})", "legendFormat": "✓ {{worker_id}}", "refId": "A"},
+        {"expr": "sum by (worker_id) (abogen_worker_jobs_total{status=\"failed\", worker_id=~\"$worker\"})", "legendFormat": "✗ {{worker_id}}", "refId": "B"}
+      ],
+      "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"]}, "displayMode": "gradient"},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    }
+
+  ],
+
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["tts", "pipeline", "abogen"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "definition": "label_values(abogen_worker_jobs_total, worker_id)",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "worker",
+        "options": [],
+        "query": {
+          "query": "label_values(abogen_worker_jobs_total, worker_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query",
+        "label": "Worker"
+      },
+      {
+        "current": {"selected": false, "text": "Prometheus", "value": "prometheus"},
+        "hide": 0,
+        "includeAll": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource",
+        "label": "Datasource"
+      }
+    ]
+  },
+  "time": {"from": "now-3h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "TTS Pipeline Monitor",
+  "uid": "tts-pipeline-monitor-v1",
+  "version": 1,
+  "weekStart": ""
+}

@@ -7,11 +7,15 @@ version: "3.9"
 # Point REDIS_URL at the main server's Redis.
 # Mount or sync the shared output directory (NFS, SFTP, or rclone).
 #
-# Usage:
-#   REDIS_URL=redis://192.168.1.10:6379 \
+# Linux usage (pre-mount NFS on host, then set OUTPUT_DIR/CHUNKS_DIR):
+#   REDIS_URL=redis://10.0.0.1:6379 \
 #   WORKER_ID=remote-1 \
 #   OUTPUT_DIR=/mnt/shared/outputs \
-#   docker compose -f docker-compose.worker.yml up -d
+#   CHUNKS_DIR=/mnt/shared/chunks \
+#   docker compose -f docker-compose.worker.yml up -d --build
+#
+# Windows usage (let Docker mount NFS — no Windows NFS client needed):
+#   docker compose -f docker-compose.worker.yml -f docker-compose.worker.nfs.yml up -d --build
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -46,11 +50,17 @@ services:
       - WORKER_ID=${WORKER_ID:-remote-1}
       - PROMETHEUS_PORT=${PROMETHEUS_PORT:-8000}
       - OUTPUT_DIR=/outputs
+      - SPOOL_DIR=/spool
+      - SMB_RETRY_INTERVAL=${SMB_RETRY_INTERVAL:-30}
       - TTS_TIMEOUT_S=${TTS_TIMEOUT_S:-600}
       - TZ=${TZ:-Africa/Nairobi}
     volumes:
-      - ${CHUNKS_DIR:-./chunks}:/chunks # must be accessible to this node
-      - ${OUTPUT_DIR:-./outputs}:/outputs        # must be shared back to main server
+      - ${CHUNKS_DIR:-./chunks}:/chunks
+      - ${OUTPUT_DIR:-./outputs}:/outputs
+      - worker-spool:/spool
     depends_on:
       - abogen
 
+volumes:
+  worker-spool:
+    # Local named volume — persists MP3s across container restarts while SMB is offline

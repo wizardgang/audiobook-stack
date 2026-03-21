@@ -19,6 +19,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: pipeline-redis
+    command: redis-server --appendonly yes
     restart: unless-stopped
     ports:
       - 10.0.0.1:6379:6379
@@ -65,6 +66,12 @@ services:
       - REDIS_URL=redis://redis:6379
       - CHUNKS_DIR=/chunks
       - CHUNK_SIZE_CHARS=3000    # chars per TTS chunk (~3 min audio)
+      - ABOGEN_HOST=${ABOGEN_HOST:-http://10.0.0.1:8808}
+      - MIN_CHAPTER_CHARS=150   # skip chapters shorter than this (blank/title pages)
+      # - SKIP_CHAPTERS=copyright,acknowledgment,dedication,about the author,bibliography,index
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}
+      - PROMETHEUS_PORT=8001
     volumes:
       - ./chunks:/chunks
       - ./inbox:/watch
@@ -85,8 +92,11 @@ services:
       - REDIS_URL=redis://redis:6379
       - OUTPUT_DIR=/outputs
       - AUDIOBOOK_DIR=/audiobooks
+      - CHUNKS_DIR=/chunks
+      - PROMETHEUS_PORT=8002
     volumes:
-      - ./outputs:/outputs        # per-chunk MP3s arrive here
+      - ${OUTPUT_DIR}:/outputs    # per-chunk MP3s arrive here (set OUTPUT_DIR in .env)
+      - ${CHUNKS_DIR}:/chunks     # text chunks for cleanup (set CHUNKS_DIR in .env)
       - ./audiobooks:/audiobooks  # final merged books land here
     networks:
       - pipeline
@@ -131,10 +141,12 @@ services:
       - "3000:3000"
     volumes:
       - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
       - grafana-data:/var/lib/grafana
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/pipeline.json
     restart: unless-stopped
     networks:
       - pipeline

@@ -885,7 +885,7 @@ def api_generate_sync() -> ResponseReturnValue:
     
     settings = load_settings()
     if not voice:
-        voice = settings.get("default_voice", "af_heart")
+        voice = settings.get("default_voice", "af_sky")
         
     if "use_gpu" in payload:
         use_gpu = coerce_bool(payload.get("use_gpu"), False)

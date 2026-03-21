@@ -1,15 +1,30 @@
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: 'abogen_workers'
+
+  # ── Core pipeline services ──────────────────────────────────────────────────
+  - job_name: 'orchestrator'
     static_configs:
-      # Add the IP address and port (8000) of EVERY remote worker machine here.
-      # Prometheus will reach out across your network to scrape their metrics!
-      - targets: 
-        - 'host.docker.internal:8000'   # Local worker (if running on this machine)
-        # - '192.168.1.50:8000'         # Example Remote Worker A
-        # - '192.168.1.51:8000'         # Example Remote Worker B
-        # - '10.0.0.15:8000'            # Example Remote Worker C
+      - targets: ['orchestrator:8001']
+        labels:
+          service: 'orchestrator'
+
+  - job_name: 'merger'
+    static_configs:
+      - targets: ['merger:8002']
+        labels:
+          service: 'merger'
+
+  # ── Worker fleet (add remote worker IPs here) ───────────────────────────────
+  - job_name: 'workers'
+    static_configs:
+      - targets:
+        - 'host.docker.internal:8000'   # local worker (if on this machine)
         - '10.0.0.9:8000'
         - '10.0.0.8:8000'
+        # - '192.168.1.50:8000'         # add more remote workers here
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
