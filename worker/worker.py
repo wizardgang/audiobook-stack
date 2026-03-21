@@ -281,7 +281,7 @@ def process_job(raw: str):
     log.info("  Chunk progress: %d/%d", done, total_chunks)
 
     # Notify merger when all chunks are complete
-    if done >= total_chunks:
+    if done == total_chunks:
         book_title = r.hget(f"book:{book_id}", "title") or title
         r.lpush(QUEUE_DONE, json.dumps({
             "book_id":  book_id,

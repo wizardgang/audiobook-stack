@@ -274,6 +274,11 @@ def main():
             continue
         _, raw = result
         try:
+            job = json.loads(raw)
+            current_status = r.hget(f"book:{job['book_id']}", "status")
+            if current_status == "complete":
+                log.info("Skipping duplicate merge for book %s — already complete", job['book_id'][:8])
+                continue
             process_merge(raw)
         except Exception as exc:
             log.exception("Unexpected error in merger: %s", exc)
