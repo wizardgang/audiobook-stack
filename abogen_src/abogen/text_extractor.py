@@ -516,8 +516,10 @@ class EpubExtractor:
                 exc_info=True,
             )
             chapters = self._process_spine_fallback()
-        # Expand any oversized chapters using ALL-CAPS heading detection
-        # (handles flat EPUBs with no nav structure where everything is one blob)
+        # Expand chapters that are too large for TTS using ALL-CAPS heading
+        # detection. Threshold is 150K chars so normal large chapters (< 150K)
+        # are left intact, but flat EPUBs with one giant blob (e.g. Sophie's
+        # World at 937K) are split into meaningful sections.
         chapters = self._expand_oversized_chapters(chapters)
 
         if not chapters:
@@ -717,9 +719,58 @@ class EpubExtractor:
             raise ValueError("No navigation entries found")
 
         ordered_entries.sort(key=lambda entry: (entry.doc_order, entry.position))
+        ordered_entries = self._drop_repeated_subsections(ordered_entries)
         chapters = self._slice_entries(ordered_entries)
         self._append_prefix_content(ordered_entries, chapters)
         return chapters
+
+    def _drop_repeated_subsections(self, entries: List[NavEntry]) -> List[NavEntry]:
+        """Remove nav entries whose titles repeat 3+ times — these are sub-section
+        labels (e.g. 'Judgment', 'Keys to Power', 'Reversal') in flat NCX/nav
+        structures where sub-sections are siblings of chapter titles rather than
+        nested children.  Removing them causes the preceding chapter entry's text
+        boundary to extend naturally, absorbing the sub-section content.
+        """
+        from collections import Counter
+        counts = Counter(e.title.strip().lower() for e in entries)
+        repeated = {title for title, n in counts.items() if n >= 3}
+        if not repeated:
+            return entries
+        filtered = [e for e in entries if e.title.strip().lower() not in repeated]
+        dropped = len(entries) - len(filtered)
+        logger.info(
+            "Dropped %d repeated sub-section nav entries (%d unique titles); %d chapters remain",
+            dropped, len(repeated), len(filtered),
+        )
+        return filtered if filtered else entries
+
+    def _merge_repeated_subsections(
+        self, chapters: List[ExtractedChapter]
+    ) -> List[ExtractedChapter]:
+        """After expansion, titles that appear 3+ times are sub-section headings
+        (e.g. 'Judgment', 'Keys to Power', 'Reversal').  Merge their text into
+        the preceding chapter so the audiobook has one track per book chapter.
+        """
+        from collections import Counter
+        counts = Counter(ch.title.strip().lower() for ch in chapters)
+        repeated = {title for title, n in counts.items() if n >= 3}
+        if not repeated:
+            return chapters
+        merged: List[ExtractedChapter] = []
+        for ch in chapters:
+            if ch.title.strip().lower() in repeated and merged:
+                prev = merged[-1]
+                merged[-1] = ExtractedChapter(
+                    title=prev.title,
+                    text=prev.text + "\n\n" + ch.text,
+                )
+            else:
+                merged.append(ch)
+        logger.info(
+            "Merged %d repeated sub-sections into %d chapters (was %d)",
+            len(chapters) - len(merged), len(merged), len(chapters),
+        )
+        return merged if merged else chapters
 
     def _process_spine_fallback(self) -> List[ExtractedChapter]:
         chapters: List[ExtractedChapter] = []
@@ -901,10 +952,9 @@ class EpubExtractor:
                     base_href,
                 )
 
-        for child_navpoint in nav_point.find_all("navPoint", recursive=False):
-            self._parse_ncx_navpoint(
-                child_navpoint, ordered_entries, doc_order, doc_order_decoded
-            )
+        # Do NOT recurse into child navPoints — top-level entries only.
+        # Sub-section content is captured naturally by the text boundary
+        # between this entry and the next top-level entry.
 
     def _parse_html_nav_li(
         self,
@@ -954,11 +1004,9 @@ class EpubExtractor:
                     base_href,
                 )
 
-        for child_ol in li_element.find_all("ol", recursive=False):
-            for child_li in child_ol.find_all("li", recursive=False):
-                self._parse_html_nav_li(
-                    child_li, ordered_entries, doc_order, doc_order_decoded
-                )
+        # Do NOT recurse into child <li> entries — top-level entries only.
+        # Sub-section content is captured naturally by the text boundary
+        # between this entry and the next top-level entry.
 
     def _find_doc_key(
         self,
@@ -1160,7 +1208,7 @@ class EpubExtractor:
     # ── Oversized-chapter expansion ──────────────────────────────────────────
 
     # Threshold: any chapter larger than this triggers the ALL-CAPS scan.
-    _OVERSIZED_CHAPTER_CHARS = 50_000
+    _OVERSIZED_CHAPTER_CHARS = 150_000
 
     @staticmethod
     def _is_caps_heading(text: str) -> bool:

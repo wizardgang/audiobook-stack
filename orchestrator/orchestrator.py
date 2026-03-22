@@ -445,6 +445,13 @@ def process_job(raw: str):
             raise RuntimeError(data.get("error", "Unknown extraction error"))
         chapters = data.get("chapters", [])
         ORCH_EXTRACTION_SECS.observe(time.time() - extraction_start)
+        log.info("  Extracted %d chapters from %s", len(chapters), pdf_path.name)
+        for i, ch in enumerate(chapters):
+            title  = ch.get("title", f"Chapter {i+1}")
+            chars  = len(ch.get("text", "").strip())
+            tts_chunks = math.ceil(chars / CHUNK_SIZE_CHARS) if chars else 0
+            log.info("    [%3d] %-50s  %7,d chars  → ~%d TTS chunk(s)",
+                     i + 1, title[:50], chars, tts_chunks)
     except Exception as exc:
         log.error("API Text extraction failed: %s", exc)
         set_book_state(book_id, status="error", error=str(exc))

@@ -49,18 +49,34 @@ def set_book_state(book_id: str, **kwargs):
     r.hset(f"book:{book_id}", mapping={k: str(v) for k, v in kwargs.items()})
 
 
-def build_concat_list(chunk_dir: Path, total: int) -> Path:
-    """Write an ffmpeg concat file listing chunks in order."""
+def _load_chunk_lookup(meta_dir: Path) -> dict[int, dict]:
+    """Load meta.json from the chunks directory into a dict keyed by chunk_idx."""
+    meta_json_file = meta_dir / "meta.json"
+    if not meta_json_file.exists():
+        log.warning("meta.json not found in %s — chapter grouping will be disabled", meta_dir)
+        return {}
+    return {e["chunk_idx"]: e for e in json.loads(meta_json_file.read_text(encoding="utf-8"))}
+
+
+def build_concat_list(chunk_dir: Path, total: int, meta_dir: Path) -> Path:
+    """Write an ffmpeg concat file listing chunks sorted by (chapter_idx, chunk_idx)."""
     concat_file = chunk_dir / "concat.txt"
+    chunk_lookup = _load_chunk_lookup(meta_dir)
+
+    ordered = sorted(
+        (idx for idx in range(total)
+         if (chunk_dir / f"chunk_{idx:04d}.mp3").exists()),
+        key=lambda idx: (chunk_lookup.get(idx, {}).get("chapter_idx", idx), idx),
+    )
+
     lines = []
-    for idx in range(total):
+    for idx in ordered:
         chunk = chunk_dir / f"chunk_{idx:04d}.mp3"
-        if not chunk.exists():
-            log.warning("Missing chunk %d, skipping in concatenation...", idx)
-            continue
-        # ffmpeg concat format requires escaped paths
         escaped = str(chunk).replace("'", "'\\''")
         lines.append(f"file '{escaped}'")
+        if idx not in {e["chunk_idx"] for e in chunk_lookup.values()}:
+            log.warning("Missing chunk %d, skipping in concatenation...", idx)
+
     concat_file.write_text("\n".join(lines), encoding="utf-8")
     return concat_file
 
@@ -78,20 +94,14 @@ def get_duration_ms(filepath: Path) -> int:
         return 0
 
 
-def build_ffmetadata(chunk_dir: Path, total: int, title: str) -> Path:
+def build_ffmetadata(chunk_dir: Path, total: int, title: str, meta_dir: Path) -> Path:
     """Build an FFMETADATA file with one chapter marker per book chapter.
 
     Multiple TTS chunks that belong to the same chapter (same chapter_idx)
     are collapsed into a single chapter entry so the audiobook player shows
     the original chapter structure, not individual TTS split points.
     """
-    meta_json_file = chunk_dir / "meta.json"
-    # Build a lookup dict keyed by chunk_idx so positional gaps (missing files,
-    # watchdog re-queues) never cause a chapter/chunk mismatch.
-    chunk_lookup: dict[int, dict] = {}
-    if meta_json_file.exists():
-        for entry in json.loads(meta_json_file.read_text(encoding="utf-8")):
-            chunk_lookup[entry["chunk_idx"]] = entry
+    chunk_lookup = _load_chunk_lookup(meta_dir)
 
     ffmeta = [";FFMETADATA1", f"title={title}"]
 
@@ -109,13 +119,17 @@ def build_ffmetadata(chunk_dir: Path, total: int, title: str) -> Path:
         ffmeta.append(f"END={end_ms}")
         ffmeta.append(f"title={ch_title}")
 
-    for idx in range(total):
-        chunk_file = chunk_dir / f"chunk_{idx:04d}.mp3"
-        if not chunk_file.exists():
-            continue
+    # Sort by (chapter_idx, chunk_idx) so watchdog-requeued or out-of-order
+    # chunks are always grouped correctly regardless of arrival order.
+    ordered = sorted(
+        ((idx, chunk_lookup.get(idx, {})) for idx in range(total)
+         if (chunk_dir / f"chunk_{idx:04d}.mp3").exists()),
+        key=lambda x: (x[1].get("chapter_idx", x[0]), x[0]),
+    )
 
+    for idx, meta in ordered:
+        chunk_file = chunk_dir / f"chunk_{idx:04d}.mp3"
         duration_ms = get_duration_ms(chunk_file)
-        meta = chunk_lookup.get(idx, {})
         ch_idx   = meta.get("chapter_idx", idx)
         ch_title = meta.get("chapter_title", f"Chapter {ch_idx + 1}")
 
@@ -136,6 +150,7 @@ def build_ffmetadata(chunk_dir: Path, total: int, title: str) -> Path:
 
 
 def merge_to_mp3(concat_file: Path, ffmeta_path: Path, out_path: Path, title: str):
+    tmp_path = out_path.with_suffix(".tmp.mp3")
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat",
@@ -144,19 +159,41 @@ def merge_to_mp3(concat_file: Path, ffmeta_path: Path, out_path: Path, title: st
         "-i", str(ffmeta_path),
         "-map_metadata", "1",
         "-c", "copy",
-        str(out_path),
+        str(tmp_path),
     ]
     log.info("  ffmpeg merge → %s", out_path.name)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+
+    validate_output(tmp_path)
+    tmp_path.rename(out_path)
+    log.info("  Validated and finalised → %s", out_path.name)
+
+
+def validate_output(out_path: Path):
+    """Run ffprobe on the finished file — raises RuntimeError if moov atom is missing or file is corrupt."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,duration",
+        "-of", "default=noprint_wrappers=1",
+        str(out_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or "moov atom not found" in result.stderr:
+        raise RuntimeError(f"Output file is corrupt (moov atom missing or invalid):\n{result.stderr}")
 
 
 def merge_to_m4b(concat_file: Path, ffmeta_path: Path, out_path: Path, title: str):
     """
     Concatenate MP3s and re-encode to AAC inside M4B or M4A container.
-    Injects precise chapter markers.
+    Injects precise chapter markers. Writes to a temp file first and only
+    renames to the final path after ffprobe validation — prevents corrupt
+    partial files from landing in the audiobook library.
     """
+    tmp_path = out_path.with_suffix(".tmp.m4b")
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat",
@@ -168,20 +205,26 @@ def merge_to_m4b(concat_file: Path, ffmeta_path: Path, out_path: Path, title: st
         "-b:a", "64k",
         "-vn",
         "-movflags", "+faststart",
-        str(out_path),
+        str(tmp_path),
     ]
     log.info("  ffmpeg encode m4b/m4a → %s", out_path.name)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+
+    validate_output(tmp_path)
+    tmp_path.rename(out_path)
+    log.info("  Validated and finalised → %s", out_path.name)
 
 
 def process_merge(raw: str):
-    job      = json.loads(raw)
-    book_id  = job["book_id"]
-    title    = job["title"]
-    total    = int(job["total"])
-    chunk_dir = Path(job["out_dir"])
+    job       = json.loads(raw)
+    book_id   = job["book_id"]
+    title     = job["title"]
+    total     = int(job["total"])
+    chunk_dir = Path(job["out_dir"])          # MP3 files live here
+    meta_dir  = CHUNKS_DIR / book_id          # meta.json lives here (written by orchestrator)
 
     log.info("Merging book %s — %s (%d chunks)", book_id[:8], title, total)
     job_start = time.time()
@@ -213,8 +256,8 @@ def process_merge(raw: str):
 
     # Build ffmpeg concat list and chapter metadata map
     try:
-        concat_file = build_concat_list(chunk_dir, total)
-        ffmeta_path = build_ffmetadata(chunk_dir, total, title)
+        concat_file = build_concat_list(chunk_dir, total, meta_dir)
+        ffmeta_path = build_ffmetadata(chunk_dir, total, title, meta_dir)
     except FileNotFoundError as exc:
         log.error("  %s", exc)
         MERGER_TOTAL.labels(status="failed").inc()

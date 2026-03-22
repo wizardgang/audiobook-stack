@@ -447,6 +447,72 @@
       "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}}
     },
     {
+      "id": 70, "type": "row", "title": "⏱️ Estimated Completion", "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 116}
+    },
+    {
+      "id": 71, "type": "stat", "title": "ETA (current queue)",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 117},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{
+        "expr": "sum(pipeline_queue_tts_depth) / sum(rate(abogen_worker_jobs_total{status=\"success\"}[$__rate_interval]))",
+        "instant": true,
+        "refId": "A"
+      }],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "Queue empty"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Queue empty",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green",  "value": null},
+              {"color": "yellow", "value": 1800},
+              {"color": "red",    "value": 7200}
+            ]
+          },
+          "color": {"mode": "thresholds"}
+        }
+      }
+    },
+    {
+      "id": 72, "type": "timeseries", "title": "ETA Over Time (how fast the queue is draining)",
+      "gridPos": {"h": 8, "w": 18, "x": 6, "y": 117},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{
+        "expr": "sum(pipeline_queue_tts_depth) / sum(rate(abogen_worker_jobs_total{status=\"success\"}[$__rate_interval]))",
+        "legendFormat": "ETA (seconds)",
+        "refId": "A"
+      }],
+      "options": {
+        "tooltip": {"mode": "single"},
+        "legend": {"displayMode": "hidden"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"lineWidth": 2, "fillOpacity": 12, "gradientMode": "opacity"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green",  "value": null},
+              {"color": "yellow", "value": 1800},
+              {"color": "red",    "value": 7200}
+            ]
+          },
+          "color": {"mode": "thresholds"}
+        }
+      }
+    },
+
+    {
       "id": 63, "type": "bargauge", "title": "Per-Worker: Success vs Failure (all time)",
       "gridPos": {"h": 6, "w": 12, "x": 12, "y": 109},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
