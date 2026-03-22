@@ -79,49 +79,59 @@ def get_duration_ms(filepath: Path) -> int:
 
 
 def build_ffmetadata(chunk_dir: Path, total: int, title: str) -> Path:
+    """Build an FFMETADATA file with one chapter marker per book chapter.
+
+    Multiple TTS chunks that belong to the same chapter (same chapter_idx)
+    are collapsed into a single chapter entry so the audiobook player shows
+    the original chapter structure, not individual TTS split points.
+    """
     meta_json_file = chunk_dir / "meta.json"
-    chunk_meta = []
+    # Build a lookup dict keyed by chunk_idx so positional gaps (missing files,
+    # watchdog re-queues) never cause a chapter/chunk mismatch.
+    chunk_lookup: dict[int, dict] = {}
     if meta_json_file.exists():
-        chunk_meta = json.loads(meta_json_file.read_text(encoding="utf-8"))
-        
+        for entry in json.loads(meta_json_file.read_text(encoding="utf-8")):
+            chunk_lookup[entry["chunk_idx"]] = entry
+
     ffmeta = [";FFMETADATA1", f"title={title}"]
-    
-    current_time = 0
-    current_chapter = None
-    chapter_start = 0
-    
+
+    current_time_ms = 0
+    # Track the current open chapter: (chapter_idx, chapter_title, start_ms)
+    open_chapter: tuple[int, str, int] | None = None
+
+    def _flush(end_ms: int):
+        if open_chapter is None:
+            return
+        _, ch_title, ch_start = open_chapter
+        ffmeta.append("[CHAPTER]")
+        ffmeta.append("TIMEBASE=1/1000")
+        ffmeta.append(f"START={ch_start}")
+        ffmeta.append(f"END={end_ms}")
+        ffmeta.append(f"title={ch_title}")
+
     for idx in range(total):
         chunk_file = chunk_dir / f"chunk_{idx:04d}.mp3"
         if not chunk_file.exists():
             continue
 
-        duration = get_duration_ms(chunk_file)
-        
-        c_title = "Chapter"
-        if idx < len(chunk_meta):
-            c_title = chunk_meta[idx].get("chapter_title", f"Chapter {chunk_meta[idx].get('chapter_idx', 0) + 1}")
-            
-        if current_chapter != c_title:
-            if current_chapter is not None:
-                ffmeta.append("[CHAPTER]")
-                ffmeta.append("TIMEBASE=1/1000")
-                ffmeta.append(f"START={chapter_start}")
-                ffmeta.append(f"END={current_time}")
-                ffmeta.append(f"title={current_chapter}")
-            current_chapter = c_title
-            chapter_start = current_time
-            
-        current_time += duration
-        
-    if current_chapter is not None:
-        ffmeta.append("[CHAPTER]")
-        ffmeta.append("TIMEBASE=1/1000")
-        ffmeta.append(f"START={chapter_start}")
-        ffmeta.append(f"END={current_time}")
-        ffmeta.append(f"title={current_chapter}")
-        
+        duration_ms = get_duration_ms(chunk_file)
+        meta = chunk_lookup.get(idx, {})
+        ch_idx   = meta.get("chapter_idx", idx)
+        ch_title = meta.get("chapter_title", f"Chapter {ch_idx + 1}")
+
+        # New chapter starts when chapter_idx changes
+        if open_chapter is None or open_chapter[0] != ch_idx:
+            _flush(current_time_ms)
+            open_chapter = (ch_idx, ch_title, current_time_ms)
+
+        current_time_ms += duration_ms
+
+    _flush(current_time_ms)
+
     ffmeta_path = chunk_dir / "ffmetadata.txt"
     ffmeta_path.write_text("\n".join(ffmeta), encoding="utf-8")
+    log.info("  FFMETADATA: %d TTS chunks → %d chapter markers",
+             total, ffmeta.count("[CHAPTER]"))
     return ffmeta_path
 
 

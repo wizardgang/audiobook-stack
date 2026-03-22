@@ -8,7 +8,7 @@ description = "Generate audiobooks from EPUBs, PDFs and text with synchronized c
 authors = [{ name = "Deniz Şafak", email = "denizsafak98@gmail.com" }]
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10, <3.13"
+requires-python = ">=3.10"
 keywords = [
   "audiobook",
   "epub",

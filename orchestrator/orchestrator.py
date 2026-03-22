@@ -58,14 +58,58 @@ ORCH_WATCHDOG_TOTAL   = Counter('pipeline_orchestrator_watchdog_resurrections_to
 # Chapters whose titles match any of these patterns (case-insensitive) are skipped.
 # Override via env: SKIP_CHAPTERS="copyright,acknowledgment,about the author,bibliography"
 _default_skip = (
-    "copyright,legal,all rights reserved,"
-    "acknowledgment,acknowledgement,"
-    "dedication,epigraph,"
-    "table of contents,contents,"
-    "about the author,about the publisher,from the publisher,"
-    "bibliography,references,further reading,index,"
-    "also by,other books by,by the same author,"
-    "praise for,endorsement"
+    # ── Copyright / legal ────────────────────────────────────────────────────
+    "copyright,legal notice,all rights reserved,terms of use,"
+    "no part of this,unauthorized reproduction,intellectual property,"
+    "isbn,ebook edition,digital edition,printed in,printing history,"
+
+    # ── Publisher imprints (common Big-5 + major imprints) ───────────────────
+    "publishing group,published by,an imprint of,"
+    "berkley,penguin,random house,harpercollins,simon & schuster,"
+    "macmillan,hachette,scholastic,tor books,orbit,del rey,"
+    "doubleday,viking,knopf,anchor books,vintage books,"
+    "st. martin,bloomsbury,little brown,grand central,"
+
+    # ── Front matter ─────────────────────────────────────────────────────────
+    "title page,half title,series page,"
+    "dedication,epigraph,inscription,"
+    "table of contents,contents,brief contents,full contents,"
+    "list of figures,list of tables,list of illustrations,list of maps,"
+    "map,maps,family tree,genealogy,cast of characters,dramatis personae,"
+    "timeline,chronology,a note on,note to the reader,"
+    "translator's note,editor's note,note on the translation,"
+    "note on the text,note on sources,a word from,"
+
+    # ── Back matter ───────────────────────────────────────────────────────────
+    "acknowledgment,acknowledgement,with thanks,special thanks,"
+    "bibliography,selected bibliography,works cited,works consulted,"
+    "references,further reading,suggested reading,recommended reading,"
+    "notes,endnotes,footnotes,source notes,"
+    "index,general index,subject index,name index,"
+    "glossary,glossary of terms,key terms,"
+    "appendix,appendices,"
+    "permissions,permissions acknowledgment,credits,"
+    "about the author,about the authors,about the illustrator,"
+    "about the publisher,from the publisher,about this book,"
+    "about the type,colophon,"
+    "also by,other books by,by the same author,other titles by,"
+    "titles by,books by,also available,also from,"
+    "more by,more books by,other works by,"
+
+    # ── Marketing / promotional ───────────────────────────────────────────────
+    "praise for,advance praise,endorsement,blurb,"
+    "what readers are saying,what critics say,"
+    "excerpt from,preview of,continue reading,sneak peek,"
+    "reading group guide,book club guide,discussion questions,"
+    "questions for discussion,topics for discussion,"
+    "a conversation with,interview with,q&a with,q & a with,"
+    "if you enjoyed,readers also enjoyed,readers who liked,"
+    "visit us at,follow us on,connect with,sign up for,join our,"
+    "newsletter,mailing list,stay connected,"
+
+    # ── Piracy watermarks ─────────────────────────────────────────────────────
+    "oceanofpdf,ebookbike,ebook bike,ebookelo,ebook3000,"
+    "z-library,zlibrary,libgen,library genesis,freebookspot"
 )
 SKIP_CHAPTER_PATTERNS = [
     p.strip().lower()
@@ -430,16 +474,17 @@ def process_job(raw: str):
         ORCH_CHAPTERS_TOTAL.labels(status="processed").inc()
         ch_chunks = split_into_chunks(ch_text, CHUNK_SIZE_CHARS)
 
-        for c_text in ch_chunks:
+        for part_idx, c_text in enumerate(ch_chunks):
             chunk_file = book_chunks_dir / f"chunk_{global_chunk_idx:04d}.txt"
             chunk_file.write_text(c_text, encoding="utf-8")
 
+            title = ch_title if len(ch_chunks) == 1 else f"{ch_title} - Part {part_idx + 1}"
             chunk_job = {
                 "book_id": book_id,
                 "chunk_idx": global_chunk_idx,
                 "chapter_idx": ch_idx,
                 "chapter_title": ch_title,
-                "title": f"{ch_title} - Part {global_chunk_idx}",
+                "title": title,
                 "text": c_text,
                 "chunk_file": str(chunk_file)
             }

@@ -28,3 +28,25 @@ scrape_configs:
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance
+
+  # ── Remote workers via ngrok tunnel ─────────────────────────────────────────
+  # ngrok free tier serves an interstitial page to non-browser clients.
+  # The header below bypasses it so Prometheus can reach /metrics directly.
+  #
+  # Usage:
+  #   scheme: https
+  #   targets: ['<id>.ngrok-free.app']   # hostname only, no https://
+  #
+  # - job_name: 'workers-ngrok'
+  #   scheme: https
+  #   metrics_path: /metrics
+  #   params: {}
+  #   http_headers:
+  #     names:
+  #       ngrok-skip-browser-warning: "true"
+  #   static_configs:
+  #     - targets:
+  #       - 'abc123.ngrok-free.app'      # replace with your ngrok hostname
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: instance

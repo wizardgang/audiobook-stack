@@ -218,19 +218,114 @@ def _build_metadata_payload(
     return normalized
 
 
+# Matches a line that looks like a chapter/section heading at the top of a page.
+# Used by _pdf_chapters_from_headings as a heuristic fallback when no TOC is present.
+_CHAPTER_HEADING_RE = re.compile(
+    r"^(?:"
+    r"(?:chapter|ch\.?)\s+(?:\d+|[ivxlcdm]+|[a-z][a-z\-]*)"
+    r"|prologue|epilogue|introduction|preface|foreword|afterword|interlude|conclusion"
+    r"|part\s+(?:\d+|[ivxlcdm]+|[a-z][a-z\-]*)"
+    r")"
+    r"(?:\s*[:\-–—]?\s*.{0,80})?$",
+    re.IGNORECASE,
+)
+
+
+def _pdf_chapters_from_toc(
+    document: Any, toc_entries: List[Tuple[str, int]]
+) -> List[ExtractedChapter]:
+    """Extract chapter text using PDF outline (TOC) page boundaries."""
+    total_pages = len(document)
+    chapters: List[ExtractedChapter] = []
+    for i, (title, start_page) in enumerate(toc_entries):
+        end_page = toc_entries[i + 1][1] if i + 1 < len(toc_entries) else total_pages
+        start_page = max(0, min(start_page, total_pages - 1))
+        end_page = min(max(start_page + 1, end_page), total_pages)
+        parts = []
+        for pn in range(start_page, end_page):
+            t = _clean_pdf_text(document[pn].get_text())
+            if t:
+                parts.append(t)
+        text = "\n\n".join(parts).strip()
+        if text:
+            chapters.append(ExtractedChapter(title=title, text=text))
+    return chapters
+
+
+def _pdf_chapters_from_headings(document: Any) -> List[ExtractedChapter]:
+    """Heuristic: look for chapter-heading-like first lines on each page.
+
+    Uses the raw (uncleaned) page text for heading detection so that
+    _clean_pdf_text's trailing-number stripping (designed to remove page
+    numbers like "Some text  42") does not corrupt heading candidates such as
+    "Chapter 1" → "Chapter".  The body text is still cleaned.
+    """
+    total_pages = len(document)
+    raw_texts: List[str] = []
+    clean_texts: List[str] = []
+    for page in cast(Iterable[fitz.Page], document):
+        raw = cast(Any, page).get_text()
+        raw_texts.append(raw)
+        clean_texts.append(_clean_pdf_text(raw))
+
+    chapter_starts: List[Tuple[int, str]] = []  # (page_index, title)
+    for i, raw in enumerate(raw_texts):
+        if not raw:
+            continue
+        first_line = raw.split("\n")[0].strip()
+        if first_line and len(first_line) <= 80 and _CHAPTER_HEADING_RE.match(first_line):
+            chapter_starts.append((i, first_line))
+
+    if len(chapter_starts) < 2:
+        return []
+
+    chapters: List[ExtractedChapter] = []
+    for i, (start_page, title) in enumerate(chapter_starts):
+        end_page = chapter_starts[i + 1][0] if i + 1 < len(chapter_starts) else total_pages
+        parts = [clean_texts[p] for p in range(start_page, end_page) if clean_texts[p]]
+        text = "\n\n".join(parts).strip()
+        if text:
+            chapters.append(ExtractedChapter(title=title, text=text))
+    return chapters
+
+
 def _extract_pdf(path: Path) -> ExtractionResult:
     metadata_source = MetadataSource()
     chapters: List[ExtractedChapter] = []
     with fitz.open(str(path)) as document:
         metadata_source = _collect_pdf_metadata(document)
-        pages = cast(Iterable[fitz.Page], document)
-        for index, page in enumerate(pages):
-            page_obj = cast(Any, page)
-            text = _clean_pdf_text(page_obj.get_text())
-            if not text:
-                continue
-            title = f"Page {index + 1}"
-            chapters.append(ExtractedChapter(title=title, text=text))
+
+        # Strategy 1: PDF outline/TOC — most reliable, exact chapter boundaries
+        toc = document.get_toc()  # [[level, title, page_1indexed], ...]
+        top_level = [(title, page - 1) for level, title, page in toc if level == 1]
+        if len(top_level) >= 2:
+            logger.info(
+                "PDF %s: using TOC (%d top-level entries) for chapter extraction",
+                path.name, len(top_level),
+            )
+            chapters = _pdf_chapters_from_toc(document, top_level)
+
+        # Strategy 2: Heuristic heading detection (Chapter N, Prologue, Part I …)
+        if not chapters:
+            chapters = _pdf_chapters_from_headings(document)
+            if chapters:
+                logger.info(
+                    "PDF %s: detected %d chapters via heading heuristics",
+                    path.name, len(chapters),
+                )
+
+        # Strategy 3: Page-by-page fallback (original behaviour)
+        if not chapters:
+            logger.info(
+                "PDF %s: no chapter structure found, falling back to page-by-page extraction",
+                path.name,
+            )
+            for index, page in enumerate(cast(Iterable[fitz.Page], document)):
+                text = _clean_pdf_text(cast(Any, page).get_text())
+                if not text:
+                    continue
+                chapters.append(ExtractedChapter(title=f"Page {index + 1}", text=text))
+
     if not chapters:
         chapters.append(ExtractedChapter(title=path.stem, text=""))
     metadata = _build_metadata_payload(metadata_source, len(chapters), "pdf", path.stem)
@@ -421,6 +516,10 @@ class EpubExtractor:
                 exc_info=True,
             )
             chapters = self._process_spine_fallback()
+        # Expand any oversized chapters using ALL-CAPS heading detection
+        # (handles flat EPUBs with no nav structure where everything is one blob)
+        chapters = self._expand_oversized_chapters(chapters)
+
         if not chapters:
             chapters = [ExtractedChapter(title=self.path.stem, text="")]
         metadata = _build_metadata_payload(
@@ -1057,3 +1156,88 @@ class EpubExtractor:
             if heading and heading.get_text(strip=True):
                 return heading.get_text(strip=True)
         return fallback
+
+    # ── Oversized-chapter expansion ──────────────────────────────────────────
+
+    # Threshold: any chapter larger than this triggers the ALL-CAPS scan.
+    _OVERSIZED_CHAPTER_CHARS = 50_000
+
+    @staticmethod
+    def _is_caps_heading(text: str) -> bool:
+        """True if *text* looks like an ALL-CAPS chapter heading paragraph."""
+        t = text.strip()
+        if not t or len(t) > 80:
+            return False
+        alpha_count = sum(c.isalpha() for c in t)
+        if alpha_count < 5:
+            return False
+        # Must be entirely uppercase (digits, spaces, punctuation are OK)
+        return t.upper() == t
+
+    def _split_by_caps_headings(
+        self, html_content: str, fallback_title: str
+    ) -> List[ExtractedChapter]:
+        """Split a single HTML blob at ALL-CAPS paragraph boundaries.
+
+        Works for EPUBs that use short uppercase <p> elements as chapter titles
+        rather than h1/h2/h3 tags (e.g. older OCR-derived or flat ePubs).
+        Returns an empty list when fewer than 2 headings are found.
+        """
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Collect leaf <p> elements in document order (skip container <p> tags
+        # that wrap other block elements — uncommon but possible).
+        paras = [p for p in soup.find_all("p") if not p.find(["p", "div"])]
+        if not paras:
+            return []
+
+        # Locate heading paragraphs
+        heading_indices: List[int] = [
+            i for i, p in enumerate(paras)
+            if self._is_caps_heading(p.get_text(strip=True))
+        ]
+        if len(heading_indices) < 2:
+            return []
+
+        heading_indices.append(len(paras))  # sentinel — marks end of last chapter
+
+        chapters: List[ExtractedChapter] = []
+        for h, next_h in zip(heading_indices[:-1], heading_indices[1:]):
+            title = paras[h].get_text(strip=True).title()
+            # Reconstruct HTML for the body paragraphs so _html_to_text handles
+            # inline markup (bold, italic, br) correctly.
+            body_html = "\n".join(str(p) for p in paras[h + 1 : next_h])
+            text = self._html_to_text(body_html)
+            if len(text.strip()) >= 150:
+                chapters.append(ExtractedChapter(title=title, text=text))
+
+        return chapters
+
+    def _expand_oversized_chapters(
+        self, chapters: List[ExtractedChapter]
+    ) -> List[ExtractedChapter]:
+        """Post-processing: when any chapter is very large (flat EPUB with no
+        nav structure), attempt to re-split all spine documents using ALL-CAPS
+        paragraph heading detection."""
+        if not any(len(ch.text) > self._OVERSIZED_CHAPTER_CHARS for ch in chapters):
+            return chapters
+
+        # Concatenate all cached spine HTML in spine order
+        all_html = "".join(
+            self.doc_content.get(href, "") for href in self.spine_docs
+        )
+        if not all_html:
+            return chapters
+
+        fallback = chapters[0].title if chapters else self.path.stem
+        expanded = self._split_by_caps_headings(all_html, fallback)
+
+        if len(expanded) >= 2:
+            logger.info(
+                "EPUB %s: expanded %d oversized chapter(s) → %d chapters "
+                "via ALL-CAPS heading detection",
+                self.path.name, len(chapters), len(expanded),
+            )
+            return expanded
+
+        return chapters
