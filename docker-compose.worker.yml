@@ -41,6 +41,8 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     container_name: pipeline-worker
+    profiles:
+      - abogen-tts          # only starts when COMPOSE_PROFILES=abogen-tts
     restart: unless-stopped
     ports:
       - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${PROMETHEUS_PORT:-8000}:${PROMETHEUS_PORT:-8000}"
