@@ -142,9 +142,24 @@ _NORMALIZE_SYSTEM = (
     "Clean the following text for TTS narration:\n"
     "- Fix hyphenated line breaks (e.g. 're-\\nplace' → 'replace')\n"
     "- Expand abbreviations that sound wrong when spoken: "
-    "Dr.→Doctor, Mr.→Mister, Mrs.→Missus, Ms.→Miss, Prof.→Professor, "
-    "vs.→versus, etc.→and so on, e.g.→for example, i.e.→that is, "
-    "approx.→approximately, dept.→department, St.→Saint\n"
+    "Dr.->Doctor, Mr.->Mister, Mrs.->Missus, Ms.->Miss, Prof.->Professor, "
+    "vs.->versus, etc.->and so on, e.g.->for example, i.e.->that is, "
+    "approx.->approximately, dept.->department, St.->Saint, "
+    "aka->also known as, a.k.a.->also known as, "
+    "asap->as soon as possible, a.s.a.p.->as soon as possible, "
+    "fyi->for your information, f.y.i.->for your information, "
+    "diy->do it yourself, rip->rest in peace, "
+    "CEO->Chief Executive Officer, CFO->Chief Financial Officer, "
+    "COO->Chief Operating Officer, CTO->Chief Technology Officer, "
+    "US->United States, UK->United Kingdom, UN->United Nations, "
+    "NASA->the National Aeronautics and Space Administration, "
+    "FBI->the Federal Bureau of Investigation, "
+    "CIA->the Central Intelligence Agency, "
+    "NYC->New York City, LA->Los Angeles, DC->Washington DC, "
+    "mph->miles per hour, km->kilometers, kg->kilograms, "
+    "lb->pounds, ft->feet, yr->year, yrs->years, "
+    "avg->average, max->maximum, min->minimum, "
+    "no.->number, vol.->volume, ch.->chapter, p.->page, pp.->pages\n"
     "- Remove footnote/endnote markers such as [1], (ibid.), (op. cit.), *\n"
     "- Fix OCR artifacts: broken words, stray characters, doubled spaces\n"
     "- Preserve paragraph breaks and natural punctuation rhythm\n"
@@ -166,7 +181,7 @@ def normalize_text_for_tts(text: str) -> str:
                 {"role": "user",   "content": text},
             ],
             max_tokens=2048,
-            temperature=0.1,
+            temperature=0.0,
         )
         normalized = resp.choices[0].message.content
         elapsed = time.time() - t0
@@ -184,12 +199,41 @@ r = redis.from_url(REDIS_URL, decode_responses=True)
 
 # ── Text extraction ──────────────────────────────────────────────────────────
 
+_ABBREV_MAP = {
+    r"\baka\b":    "also known as",
+    r"\ba\.k\.a\.": "also known as",
+    r"\basap\b":   "as soon as possible",
+    r"\bfyi\b":    "for your information",
+    r"\bdiy\b":    "do it yourself",
+    r"\brip\b":    "rest in peace",
+    r"\bviz\b":    "namely",
+    r"\bbtw\b":    "by the way",
+    r"\bimo\b":    "in my opinion",
+    r"\bimho\b":   "in my humble opinion",
+    r"\betc\.\b":  "and so on",
+    r"\be\.g\.\b": "for example",
+    r"\bi\.e\.\b": "that is",
+    r"\bvs\.\b":   "versus",
+    r"\bDr\.\b":   "Doctor",
+    r"\bMr\.\b":   "Mister",
+    r"\bMrs\.\b":  "Missus",
+    r"\bMs\.\b":   "Miss",
+    r"\bProf\.\b": "Professor",
+    r"\bSt\.\b":   "Saint",
+    r"\bno\.\b":   "number",
+    r"\bvol\.\b":  "volume",
+    r"\bch\.\b":   "chapter",
+    r"\bpp\.\b":   "pages",
+    r"\bp\.\b":    "page",
+}
+
 def filter_text(text: str) -> str:
-    """Apply content filters to remove unwanted text like URLs."""
-    # Remove URLs (http/https/www)
+    """Remove URLs and expand common abbreviations for TTS clarity."""
+    # Remove URLs
     text = re.sub(r"https?://\S+|www\.\S+", "", text)
-    # Add other word filters here if needed:
-    # text = re.sub(r"\b(word_to_remove|another_word)\b", "", text, flags=re.IGNORECASE)
+    # Expand abbreviations deterministically (runs even without AI key)
+    for pattern, replacement in _ABBREV_MAP.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
 
 def is_toc_page(page, page_text: str, page_num: int, total_pages: int) -> bool:
@@ -300,7 +344,7 @@ def split_into_chunks_ai(text: str, max_chars: int) -> list[str] | None:
             model=OPENROUTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
-            temperature=0.1,
+            temperature=0.0,
         )
         raw = resp.choices[0].message.content or ""
 
@@ -450,7 +494,7 @@ def process_job(raw: str):
             title  = ch.get("title", f"Chapter {i+1}")
             chars  = len(ch.get("text", "").strip())
             tts_chunks = math.ceil(chars / CHUNK_SIZE_CHARS) if chars else 0
-            log.info("    [%3d] %-50s  %7,d chars  → ~%d TTS chunk(s)",
+            log.info("    [%3d] %-50s  %7d chars  -> ~%d TTS chunk(s)",
                      i + 1, title[:50], chars, tts_chunks)
     except Exception as exc:
         log.error("API Text extraction failed: %s", exc)

@@ -4,7 +4,7 @@ EXCLUDES = --exclude=inbox --exclude=outputs --exclude=audiobooks --exclude=.git
 USER ?= root
 DEST ?= /root/tts-node
 
-.PHONY: up down logs status reset worker-remote inject sync watch-sync retry books invalidate-chunks
+.PHONY: up down logs status reset worker-remote inject sync watch-sync retry books invalidate-chunks purge-book
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 
@@ -78,6 +78,23 @@ pause:
 resume:
 	@echo "Resuming pipeline cluster..."
 	@docker exec pipeline-redis redis-cli del pipeline:state
+
+# ── Purge a book and restart from scratch ─────────────────────────────────
+# Usage: make purge-book BOOK_ID=<id>
+# Removes all TTS chunks from the queue, deletes Redis state, then
+# re-queues the book for full re-processing via pipeline:orchestrate.
+purge-book:
+	@test -n "$(BOOK_ID)" || (echo "Usage: make purge-book BOOK_ID=<id>"; exit 1)
+	@echo "Removing TTS chunks for $(BOOK_ID) from queue..."
+	@docker exec pipeline-redis redis-cli eval "local items = redis.call('lrange', KEYS[1], 0, -1); local removed = 0; for _, item in ipairs(items) do if string.find(item, ARGV[1], 1, true) then redis.call('lrem', KEYS[1], 1, item); removed = removed + 1 end end; return removed" 1 pipeline:tts "$(BOOK_ID)"
+	@echo "Deleting Redis state keys..."
+	@docker exec pipeline-redis redis-cli eval "local keys = redis.call('keys', 'chunk:$(BOOK_ID):*'); for _, k in ipairs(keys) do redis.call('del', k) end; return #keys" 0
+	@docker exec pipeline-redis redis-cli srem pipeline:seen_files "$(BOOK_ID)"
+	@BOOK_FILE=$$(docker exec pipeline-redis redis-cli hget "book:$(BOOK_ID)" filename); \
+	docker exec pipeline-redis redis-cli del "book:$(BOOK_ID)"; \
+	echo "Re-queuing $$BOOK_FILE for full re-processing..."; \
+	docker exec pipeline-redis redis-cli lpush pipeline:orchestrate "{\"id\":\"$(BOOK_ID)\",\"path\":\"/inbox/$$BOOK_FILE\"}"
+	@echo "Done — book $(BOOK_ID) will be re-processed from scratch"
 
 # ── Retry failed merge ────────────────────────────────────────────────────
 # Usage: make retry BOOK_ID=<book_id>
