@@ -200,6 +200,13 @@ def _split_text(text: str, max_chars: int) -> list[str]:
     return [s for s in segments if s]
 
 
+# ── F5-TTS progress stub ─────────────────────────────────────────────────────
+class _NoopProgress:
+    """Minimal stand-in for gr.Progress() — satisfies F5-TTS's progress.tqdm() calls."""
+    def __call__(self, *args, **kwargs): pass
+    def tqdm(self, iterable, *args, **kwargs): return iterable
+
+
 # ── F5-TTS synthesis ──────────────────────────────────────────────────────────
 
 def synthesize_text(text: str) -> bytes:
@@ -231,7 +238,7 @@ def synthesize_text(text: str) -> bytes:
                 gen_text=seg,
                 speed=F5_SPEED,
                 show_info=lambda *args, **kwargs: None,
-                progress=lambda *args, **kwargs: None,
+                progress=_NoopProgress(),
             )
         sample_rate = sr
         audio_parts.append(wav)
