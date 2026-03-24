@@ -45,7 +45,6 @@ F5_REF_AUDIO   = os.environ.get("F5_REF_AUDIO",   "/ref/reference.wav")
 F5_REF_TEXT    = os.environ.get("F5_REF_TEXT",    "")
 F5_SPEED       = float(os.environ.get("F5_SPEED", "1.0"))
 F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
-F5_VOCODER     = os.environ.get("F5_VOCODER",     "vocos")
 
 # Max chars per synthesis call — F5-TTS degrades on very long inputs
 F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "1000"))
@@ -85,7 +84,7 @@ def get_tts_engine():
             return _tts_engine
         log.info("Loading F5-TTS model '%s' on device '%s' ...", F5_MODEL, F5_DEVICE)
         from f5_tts.api import F5TTS
-        _tts_engine = F5TTS(model=F5_MODEL, device=F5_DEVICE, vocoder_name=F5_VOCODER)
+        _tts_engine = F5TTS(model=F5_MODEL, device=F5_DEVICE)
         log.info("F5-TTS model loaded.")
     return _tts_engine
 
