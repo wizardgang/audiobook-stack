@@ -9,6 +9,7 @@
 
 import io
 import os
+import contextlib
 import json
 import time
 import shutil
@@ -231,14 +232,15 @@ def synthesize_text(text: str) -> bytes:
 
     for i, seg in enumerate(segments):
         with TTS_LATENCY.labels(worker_id=WORKER_ID).time():
-            wav, sr, _ = engine.infer(
-                ref_file=ref_audio,
-                ref_text=ref_text,
-                gen_text=seg,
-                speed=F5_SPEED,
-                show_info=lambda *args, **kwargs: None,
-                progress=_NoopProgress(),
-            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                wav, sr, _ = engine.infer(
+                    ref_file=ref_audio,
+                    ref_text=ref_text,
+                    gen_text=seg,
+                    speed=F5_SPEED,
+                    show_info=lambda *args, **kwargs: None,
+                    progress=_NoopProgress(),
+                )
         sample_rate = sr
         audio_parts.append(wav)
         log.debug("  Segment %d/%d done (%d samples)", i + 1, len(segments), len(wav))
