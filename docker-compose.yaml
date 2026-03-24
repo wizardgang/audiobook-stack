@@ -9,8 +9,6 @@ volumes:
   redis-data:
   prometheus-data:
   grafana-data:
-  f5-models:
-  f5-spool:
 
 # ─────────────────────────────────────────────
 # Services
@@ -68,7 +66,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - CHUNKS_DIR=/chunks
       - CHUNK_SIZE_CHARS=3000    # chars per TTS chunk (~3 min audio)
-      - ABOGEN_HOST=${ABOGEN_HOST:-http://10.0.0.1:8808}
+      - ABOGEN_HOST=${ABOGEN_HOST:-http://abogen:8808}
       - MIN_CHAPTER_CHARS=150   # skip chapters shorter than this (blank/title pages)
       # - SKIP_CHAPTERS=copyright,acknowledgment,dedication,about the author,bibliography,index
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
@@ -107,40 +105,24 @@ services:
         condition: service_healthy
 
   
-  # ── F5-TTS WORKER (zero-shot voice cloning) ──
-  f5-worker:
+  # ── 4. ABOGEN API (text extraction + NLP chunking) ──
+  abogen:
     build:
-      context: ./f5-worker
+      context: .
       dockerfile: Dockerfile
-    container_name: pipeline-f5-worker
+    image: abogen-cpu:local
+    container_name: abogen-worker
     restart: unless-stopped
-    environment:
-      - TZ=Africa/Nairobi
-      - REDIS_URL=redis://redis:6379
-      - OUTPUT_DIR=/outputs
-      - SPOOL_DIR=/spool
-      - WORKER_ID=${F5_WORKER_ID:-f5-local-1}
-      - PROMETHEUS_PORT=8000
-      # F5-TTS model settings
-      - F5_MODEL=${F5_MODEL:-F5TTS_v1_Base}
-      - F5_DEVICE=${F5_DEVICE:-cpu}          # set to "cuda" for GPU nodes
-      - F5_SPEED=${F5_SPEED:-1.0}
-      - F5_MAX_CHARS=${F5_MAX_CHARS:-1000}
-      # Reference audio for voice cloning (mount your WAV below)
-      - F5_REF_AUDIO=/ref/reference.wav
-      - F5_REF_TEXT=${F5_REF_TEXT:-}
+    ports:
+      - "${ABOGEN_BIND_IP:-10.0.0.1}:${ABOGEN_PORT:-8808}:${ABOGEN_PORT:-8808}"
     volumes:
-      - ${OUTPUT_DIR}:/outputs               # shared MP3 output volume
-      - ./f5-worker/ref:/ref                 # place reference.wav here
-      - f5-models:/models                    # cached HuggingFace weights
-      - f5-spool:/spool
+      - ${CHUNKS_DIR:-./chunks}:/data/uploads
+      - ${OUTPUT_DIR:-./outputs}:/data/outputs
+    environment:
+      - ABOGEN_PORT=${ABOGEN_PORT:-8808}
+      - TZ=Africa/Nairobi
     networks:
       - pipeline
-    depends_on:
-      redis:
-        condition: service_healthy
-    ports:
-      - "8003:8000"                          # Prometheus metrics
 
   audiobookshelf:
     image: ghcr.io/advplyr/audiobookshelf:latest
