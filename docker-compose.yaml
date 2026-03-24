@@ -103,7 +103,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-
   
   # ── 4. ABOGEN API (text extraction + NLP chunking) ──
   abogen:
@@ -113,8 +112,6 @@ services:
     image: abogen-cpu:local
     container_name: abogen-worker
     restart: unless-stopped
-    ports:
-      - "${ABOGEN_BIND_IP:-10.0.0.1}:${ABOGEN_PORT:-8808}:${ABOGEN_PORT:-8808}"
     volumes:
       - ${CHUNKS_DIR:-./chunks}:/data/uploads
       - ${OUTPUT_DIR:-./outputs}:/data/outputs
