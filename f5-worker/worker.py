@@ -230,8 +230,8 @@ def synthesize_text(text: str) -> bytes:
                 ref_text=ref_text,
                 gen_text=seg,
                 speed=F5_SPEED,
-                show_info=False,
-                progress=None,
+                show_info=lambda *args, **kwargs: None,
+                progress=lambda *args, **kwargs: None,
             )
         sample_rate = sr
         audio_parts.append(wav)
