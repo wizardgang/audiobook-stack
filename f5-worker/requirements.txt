@@ -1,0 +1,5 @@
+redis
+prometheus-client
+soundfile
+pydub
+f5-tts
