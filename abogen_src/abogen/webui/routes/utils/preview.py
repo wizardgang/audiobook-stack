@@ -64,7 +64,6 @@ def generate_preview_audio(
     pronunciation_overrides: Optional[Iterable[Mapping[str, Any]]] = None,
     manual_overrides: Optional[Iterable[Mapping[str, Any]]] = None,
     speakers: Optional[Mapping[str, Any]] = None,
-    is_ssml: bool = False,
 ) -> bytes:
     if not text.strip():
         raise ValueError("Preview text is required")
@@ -95,9 +94,7 @@ def generate_preview_audio(
             source_text = text
 
     normalized_text = source_text
-    if provider != "supertonic" and not is_ssml:
-        # Skip normalization when caller has already produced SSML — running the
-        # normalizer over SSML would corrupt the XML tags.
+    if provider != "supertonic":
         try:
             from abogen.kokoro_text_normalization import normalize_for_pipeline
 
@@ -184,7 +181,6 @@ def synthesize_preview(
     pronunciation_overrides: Optional[Iterable[Mapping[str, Any]]] = None,
     manual_overrides: Optional[Iterable[Mapping[str, Any]]] = None,
     speakers: Optional[Mapping[str, Any]] = None,
-    is_ssml: bool = False,
 ) -> ResponseReturnValue:
     try:
         audio_bytes = generate_preview_audio(
@@ -199,7 +195,6 @@ def synthesize_preview(
             pronunciation_overrides=pronunciation_overrides,
             manual_overrides=manual_overrides,
             speakers=speakers,
-            is_ssml=is_ssml,
         )
     except Exception as e:
         raise e

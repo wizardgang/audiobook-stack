@@ -884,8 +884,6 @@ def api_generate_sync() -> ResponseReturnValue:
     formatting = payload.get("format", "mp3")
     # Speed multiplier — orchestrator may set this via voice blend config
     speed = float(payload.get("speed", 1.0))
-    # When True, text is already SSML; skip Kokoro text normalization
-    is_ssml = bool(payload.get("is_ssml", False))
 
     settings = load_settings()
     if not voice:
@@ -905,7 +903,6 @@ def api_generate_sync() -> ResponseReturnValue:
             speed=speed,
             use_gpu=use_gpu,
             max_seconds=3600.0,
-            is_ssml=is_ssml,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500

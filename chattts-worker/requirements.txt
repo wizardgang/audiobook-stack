@@ -1,0 +1,7 @@
+ChatTTS
+redis
+prometheus-client
+soundfile
+pydub
+numpy
+torch

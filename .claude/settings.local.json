@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r def.*test /e/WorkSpace/afidone/abogen/tts-node/abogen_src/abogen/webui/test_*.py)",
+      "Skill(claude-api)",
+      "Bash(python:*)",
+      "Bash(find /e/WorkSpace/afidone/abogen/tts-node -maxdepth 1 -type f -name *.py)",
+      "Bash(grep -E \"\\\\.py$|lib|util|shared\")",
+      "Bash(\"E:/WorkSpace/afidone/abogen/.venv/Scripts/python.exe\" --version)",
+      "Bash(\"E:/WorkSpace/afidone/abogen/.venv/Scripts/python.exe\" -m pytest tests/test_text_extractor.py -v)",
+      "Bash(\"E:/WorkSpace/afidone/abogen/.venv/Scripts/python.exe\" \"tests/test_text_extractor.py\" \"C:/Users/ADMIN/Downloads/_OceanofPDF.com_48_laws_of_powers_-_Robert_Greene.epub\")",
+      "Bash(\"E:/WorkSpace/afidone/abogen/.venv/Scripts/python.exe\" \"abogen/webui/test_extraction.py\" \"C:/Users/ADMIN/Downloads/_OceanofPDF.com_48_laws_of_powers_-_Robert_Greene.epub\")",
+      "Bash(\"E:/WorkSpace/afidone/abogen/.venv/Scripts/python.exe\" \"abogen/webui/test_extraction.py\" \"C:/Users/ADMIN/Downloads/The_ex_vows_-_Jessica_Joyce.pdf\")",
+      "Bash(\"E:/WorkSpace/afidone/abogen/.venv/Scripts/python.exe\" \"abogen/webui/test_extraction.py\" \"C:/Users/ADMIN/Downloads/Sophies_World_About_the_History_of_Philos_.epub\")"
+    ]
+  }
+}

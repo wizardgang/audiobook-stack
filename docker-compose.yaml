@@ -74,11 +74,6 @@ services:
       # ── Kokoro voice blending ──────────────────────────────────────────────
       - KOKORO_VOICE_BLEND=${KOKORO_VOICE_BLEND:-}
       - KOKORO_SPEED=${KOKORO_SPEED:-1.0}
-      # ── Kokoro SSML generation ─────────────────────────────────────────────
-      - KOKORO_SSML_ENABLED=${KOKORO_SSML_ENABLED:-false}
-      - KOKORO_GENRE=${KOKORO_GENRE:-fiction}
-      - KOKORO_GENRE_AUTO_DETECT=${KOKORO_GENRE_AUTO_DETECT:-true}
-      - KOKORO_SSML_AI_ENHANCED=${KOKORO_SSML_AI_ENHANCED:-false}
       - PROMETHEUS_PORT=8001
     volumes:
       - ./chunks:/chunks

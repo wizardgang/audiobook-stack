@@ -1,15 +1,13 @@
-"""F5-TTS Worker service
-- Runs on each node (local or remote)
+"""ChatTTS Worker service
 - Pulls chunk jobs from pipeline:tts
-- Synthesizes audio directly using F5-TTS (zero-shot voice cloning)
+- Synthesizes audio directly using ChatTTS (local inference, no HTTP call)
 - Writes MP3 to shared OUTPUT_DIR; spools locally if OUTPUT_DIR is offline
 - Background thread flushes spool → OUTPUT_DIR when the mount recovers
-- Exports Prometheus metrics on port 8000
+- Exports Prometheus metrics on port 8004 (default)
 """
 
 import io
 import os
-import contextlib
 import json
 import time
 import shutil
@@ -24,73 +22,93 @@ from prometheus_client import start_http_server, Counter, Histogram, Gauge
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(worker_id)s] %(message)s",
+    format="%(asctime)s [chattts] %(levelname)s [%(worker_id)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-WORKER_ID = os.environ.get("WORKER_ID", "f5-local-1")
+WORKER_ID = os.environ.get("WORKER_ID", "chattts-local-1")
 
 log = logging.LoggerAdapter(
     logging.getLogger(__name__),
-    {"worker_id": WORKER_ID}
+    {"worker_id": WORKER_ID},
 )
 
-REDIS_URL          = os.environ.get("REDIS_URL",           "redis://localhost:6379")
-OUTPUT_DIR         = Path(os.environ.get("OUTPUT_DIR",     "/data/outputs"))
-SPOOL_DIR          = Path(os.environ.get("SPOOL_DIR",      "/spool"))
+REDIS_URL          = os.environ.get("REDIS_URL",          "redis://localhost:6379")
+OUTPUT_DIR         = Path(os.environ.get("OUTPUT_DIR",    "/data/outputs"))
+SPOOL_DIR          = Path(os.environ.get("SPOOL_DIR",     "/spool"))
 SMB_RETRY_INTERVAL = int(os.environ.get("SMB_RETRY_INTERVAL", "30"))
 
-# F5-TTS configuration
-F5_MODEL       = os.environ.get("F5_MODEL",       "F5TTS_v1_Base")
-F5_REF_AUDIO   = os.environ.get("F5_REF_AUDIO",   "/ref/reference.wav")
-F5_REF_TEXT    = os.environ.get("F5_REF_TEXT",    "")
-F5_SPEED       = float(os.environ.get("F5_SPEED", "1.0"))
-F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
+# ChatTTS configuration
+# Speed: integer 1–9 where 5 is normal pace. Maps to the job's float speed multiplier.
+CHATTTS_SPEED       = int(os.environ.get("CHATTTS_SPEED",       "5"))
+CHATTTS_TEMPERATURE = float(os.environ.get("CHATTTS_TEMPERATURE", "0.3"))
+CHATTTS_TOP_P       = float(os.environ.get("CHATTTS_TOP_P",      "0.7"))
+CHATTTS_TOP_K       = int(os.environ.get("CHATTTS_TOP_K",        "20"))
+# Integer seed for reproducible speaker embedding (same voice across all chunks).
+CHATTTS_SPEAKER_SEED = int(os.environ.get("CHATTTS_SPEAKER_SEED", "42"))
+# Max chars per synthesis segment — quality degrades on very long inputs.
+CHATTTS_MAX_CHARS   = int(os.environ.get("CHATTTS_MAX_CHARS",   "300"))
+CHATTTS_DEVICE      = os.environ.get(
+    "CHATTTS_DEVICE",
+    "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu",
+)
 
-# Max chars per synthesis call — F5-TTS degrades on very long inputs
-F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "1000"))
+# ChatTTS sample rate is always 24 kHz
+CHATTTS_SAMPLE_RATE = 24000
 
-QUEUE_TTS    = "pipeline:tts"
-QUEUE_DONE   = "pipeline:done"
+QUEUE_TTS  = "pipeline:tts"
+QUEUE_DONE = "pipeline:done"
 
-# ── Prometheus Metrics ───────────────────────────────────────────────────────
-JOBS_PROCESSED  = Counter('f5_worker_jobs_total', 'Total chunks processed', ['worker_id', 'status'])
-TTS_LATENCY     = Histogram('f5_worker_tts_latency_seconds', 'F5-TTS synthesis latency per segment', ['worker_id'])
-REDIS_RECONNECTS = Counter('f5_worker_redis_reconnects_total', 'Redis reconnection count', ['worker_id'])
-WORKER_HEARTBEAT = Gauge('f5_worker_heartbeat_timestamp', 'Last activity timestamp', ['worker_id'])
-WORKER_STATUS   = Gauge('f5_worker_status', 'Worker state (0=Idle, 1=Processing, 2=Error)', ['worker_id'])
-WORKER_LOGS     = Counter('f5_worker_logs_total', 'Warning/error log count', ['worker_id', 'level'])
-JOB_START_TIME  = Gauge('f5_worker_job_start_timestamp_seconds', 'Chunk start timestamp', ['worker_id'])
-JOB_COMPLETION_TIME = Gauge('f5_worker_job_completion_timestamp_seconds', 'Chunk completion timestamp', ['worker_id'])
-JOB_DURATION    = Histogram('f5_worker_job_processing_duration_seconds', 'End-to-end chunk processing time', ['worker_id'])
-OUTPUT_WRITE_SECS = Histogram('f5_worker_output_write_seconds', 'Time to write MP3 to destination', ['worker_id', 'dest'],
-                               buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30])
-SPOOL_FILES     = Gauge('f5_worker_spool_files', 'MP3 files waiting in local spool', ['worker_id'])
-SPOOL_FLUSHED   = Counter('f5_worker_spool_flushed_total', 'MP3 files flushed from spool to OUTPUT_DIR', ['worker_id'])
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+JOBS_PROCESSED   = Counter("chattts_worker_jobs_total", "Total chunks processed", ["worker_id", "status"])
+TTS_LATENCY      = Histogram("chattts_worker_tts_latency_seconds", "ChatTTS synthesis latency per segment", ["worker_id"])
+REDIS_RECONNECTS = Counter("chattts_worker_redis_reconnects_total", "Redis reconnection count", ["worker_id"])
+WORKER_HEARTBEAT = Gauge("chattts_worker_heartbeat_timestamp", "Last activity timestamp", ["worker_id"])
+WORKER_STATUS    = Gauge("chattts_worker_status", "Worker state (0=Idle, 1=Processing, 2=Error)", ["worker_id"])
+WORKER_LOGS      = Counter("chattts_worker_logs_total", "Warning/error log count", ["worker_id", "level"])
+JOB_START_TIME   = Gauge("chattts_worker_job_start_timestamp_seconds", "Chunk start timestamp", ["worker_id"])
+JOB_COMPLETION_TIME = Gauge("chattts_worker_job_completion_timestamp_seconds", "Chunk completion timestamp", ["worker_id"])
+JOB_DURATION     = Histogram("chattts_worker_job_processing_duration_seconds", "End-to-end chunk processing time", ["worker_id"])
+OUTPUT_WRITE_SECS = Histogram(
+    "chattts_worker_output_write_seconds", "Time to write MP3 to destination",
+    ["worker_id", "dest"], buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30],
+)
+SPOOL_FILES  = Gauge("chattts_worker_spool_files", "MP3 files waiting in local spool", ["worker_id"])
+SPOOL_FLUSHED = Counter("chattts_worker_spool_flushed_total", "MP3 files flushed from spool to OUTPUT_DIR", ["worker_id"])
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# ── F5-TTS engine (lazy-loaded on first use) ──────────────────────────────────
-_tts_engine = None
-_tts_lock   = threading.Lock()
+# ── ChatTTS engine (lazy-loaded on first use) ─────────────────────────────────
+_chat       = None
+_spk_emb    = None
+_engine_lock = threading.Lock()
 
 
-def get_tts_engine():
-    """Return a shared F5TTS instance, initializing it on first call."""
-    global _tts_engine
-    if _tts_engine is not None:
-        return _tts_engine
-    with _tts_lock:
-        if _tts_engine is not None:
-            return _tts_engine
-        log.info("Loading F5-TTS model '%s' on device '%s' ...", F5_MODEL, F5_DEVICE)
-        from f5_tts.api import F5TTS
-        _tts_engine = F5TTS(model=F5_MODEL, device=F5_DEVICE)
-        log.info("F5-TTS model loaded.")
-    return _tts_engine
+def get_engine():
+    """Return a shared (chat, spk_emb) pair, loading the model on first call."""
+    global _chat, _spk_emb
+    if _chat is not None:
+        return _chat, _spk_emb
+    with _engine_lock:
+        if _chat is not None:
+            return _chat, _spk_emb
+        log.info("Loading ChatTTS model on device '%s' ...", CHATTTS_DEVICE)
+        import ChatTTS
+        chat = ChatTTS.Chat()
+        chat.load(device=CHATTTS_DEVICE, compile=False)
+
+        # Fix a speaker embedding so every chunk in the book sounds the same.
+        # torch.manual_seed makes sample_random_speaker deterministic.
+        import torch
+        torch.manual_seed(CHATTTS_SPEAKER_SEED)
+        spk_emb = chat.sample_random_speaker()
+
+        _chat, _spk_emb = chat, spk_emb
+        log.info("ChatTTS model loaded (speaker seed=%d).", CHATTTS_SPEAKER_SEED)
+    return _chat, _spk_emb
 
 
-# ── SMB / Output-dir availability probe ──────────────────────────────────────
+# ── Output / spool helpers ────────────────────────────────────────────────────
 
 def _output_available() -> bool:
     try:
@@ -103,11 +121,6 @@ def _output_available() -> bool:
 
 
 def save_mp3(book_id: str, chunk_idx: int, mp3_bytes: bytes) -> str:
-    """
-    Write mp3_bytes to OUTPUT_DIR/{book_id}/chunk_NNNN.mp3.
-    Falls back to SPOOL_DIR if OUTPUT_DIR is unavailable.
-    Returns the destination path string.
-    """
     rel = Path(book_id) / f"chunk_{chunk_idx:04d}.mp3"
 
     if _output_available():
@@ -174,8 +187,8 @@ def spool_flush_loop():
 
 def _split_text(text: str, max_chars: int) -> list[str]:
     """
-    Split text into segments of at most max_chars characters, breaking on
-    sentence boundaries (period, exclamation, question mark) where possible.
+    Split text into segments of at most max_chars, breaking on sentence
+    boundaries (period, exclamation, question mark, newline) where possible.
     """
     if len(text) <= max_chars:
         return [text]
@@ -185,79 +198,85 @@ def _split_text(text: str, max_chars: int) -> list[str]:
         if len(text) <= max_chars:
             segments.append(text)
             break
-        # Find a good break point within the limit
         boundary = -1
-        for punct in ('.', '!', '?', '\n'):
+        for punct in (".", "!", "?", "\n"):
             pos = text.rfind(punct, 0, max_chars)
             if pos > boundary:
                 boundary = pos
         if boundary <= 0:
-            # No sentence boundary — hard-cut at max_chars
             boundary = max_chars - 1
-        segments.append(text[:boundary + 1].strip())
-        text = text[boundary + 1:].strip()
+        segments.append(text[: boundary + 1].strip())
+        text = text[boundary + 1 :].strip()
 
     return [s for s in segments if s]
 
 
-# ── F5-TTS progress stub ─────────────────────────────────────────────────────
-class _NoopProgress:
-    """Minimal stand-in for gr.Progress() — satisfies F5-TTS's progress.tqdm() calls."""
-    def __call__(self, *args, **kwargs): pass
-    def tqdm(self, iterable, *args, **kwargs): return iterable
-
-
-# ── F5-TTS synthesis ──────────────────────────────────────────────────────────
-
-def synthesize_text(text: str) -> tuple[bytes, float]:
+def _speed_to_chattts(speed_multiplier: float) -> int:
     """
-    Synthesize text using F5-TTS and return (mp3_bytes, audio_duration_seconds).
+    Map a job speed float (0.5–2.0, 1.0=normal) to ChatTTS speed int (1–9, 5=normal).
+    The base speed is CHATTTS_SPEED (env var); the job multiplier scales it.
+    """
+    scaled = CHATTTS_SPEED * speed_multiplier
+    return max(1, min(9, round(scaled)))
+
+
+# ── Synthesis ─────────────────────────────────────────────────────────────────
+
+def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, float]:
+    """
+    Synthesize text using ChatTTS and return (mp3_bytes, audio_duration_seconds).
     Long texts are split into segments and concatenated.
     """
-    ref_audio = F5_REF_AUDIO
-    ref_text  = F5_REF_TEXT
+    import ChatTTS
 
-    if not Path(ref_audio).exists():
-        raise FileNotFoundError(
-            f"Reference audio not found: {ref_audio}. "
-            "Set F5_REF_AUDIO env var to a valid .wav file path."
-        )
+    chat, spk_emb = get_engine()
+    segments = _split_text(text, CHATTTS_MAX_CHARS)
+    chattts_speed = _speed_to_chattts(speed_multiplier)
 
-    engine   = get_tts_engine()
-    segments = _split_text(text, F5_MAX_CHARS)
-    word_count = len(text.split())
-    log.info("  Text: %d chars, %d words → %d segment(s)", len(text), word_count, len(segments))
+    log.info(
+        "  Text: %d chars → %d segment(s), speed=%d",
+        len(text), len(segments), chattts_speed,
+    )
+
+    params_infer = ChatTTS.Chat.InferCodeParams(
+        spk_emb=spk_emb,
+        temperature=CHATTTS_TEMPERATURE,
+        top_P=CHATTTS_TOP_P,
+        top_K=CHATTTS_TOP_K,
+        speed=chattts_speed,
+    )
+    params_refine = ChatTTS.Chat.RefineTextParams(
+        prompt="[oral_2][laugh_0][break_4]",
+    )
 
     audio_parts: list[np.ndarray] = []
-    sample_rate = 24000  # F5-TTS default
 
     for i, seg in enumerate(segments):
-        seg_words = len(seg.split())
         t_seg = time.monotonic()
         with TTS_LATENCY.labels(worker_id=WORKER_ID).time():
-            with contextlib.redirect_stdout(io.StringIO()):
-                wav, sr, _ = engine.infer(
-                    ref_file=ref_audio,
-                    ref_text=ref_text,
-                    gen_text=seg,
-                    speed=F5_SPEED,
-                    show_info=lambda *args, **kwargs: None,
-                    progress=_NoopProgress(),
-                )
-        seg_dur   = len(wav) / sr
+            wavs = chat.infer(
+                [seg],
+                params_refine_text=params_refine,
+                params_infer_code=params_infer,
+            )
+        wav = wavs[0]
+        if wav.ndim > 1:
+            wav = wav[0]
+        seg_dur     = len(wav) / CHATTTS_SAMPLE_RATE
         seg_elapsed = time.monotonic() - t_seg
-        rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0
-        log.info("  Seg %d/%d: %d words → %.1fs audio  (%.1fs wall, RTF %.2f)",
-                 i + 1, len(segments), seg_words, seg_dur, seg_elapsed, rtf)
-        sample_rate = sr
+        rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0.0
+        log.info(
+            "  Seg %d/%d: %.1fs audio  (%.1fs wall, RTF %.2f)",
+            i + 1, len(segments), seg_dur, seg_elapsed, rtf,
+        )
         audio_parts.append(wav)
 
     combined  = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
-    total_dur = len(combined) / sample_rate
+    total_dur = len(combined) / CHATTTS_SAMPLE_RATE
 
-    # Convert numpy float32 WAV → MP3 bytes via pydub
+    # float32 numpy → WAV → MP3
     buf = io.BytesIO()
-    sf.write(buf, combined, sample_rate, format="WAV", subtype="PCM_16")
+    sf.write(buf, combined, CHATTTS_SAMPLE_RATE, format="WAV", subtype="PCM_16")
     buf.seek(0)
     audio_seg = AudioSegment.from_wav(buf)
     mp3_buf = io.BytesIO()
@@ -272,7 +291,6 @@ def set_chunk_state(book_id: str, chunk_idx: int, **kwargs):
 
 
 def increment_done(book_id: str) -> tuple[int, int]:
-    """Atomically bump done_chunks; return (done, total)."""
     done  = r.hincrby(f"book:{book_id}", "done_chunks", 1)
     total = int(r.hget(f"book:{book_id}", "total_chunks") or 0)
     return done, total
@@ -281,12 +299,13 @@ def increment_done(book_id: str) -> tuple[int, int]:
 # ── Job processor ─────────────────────────────────────────────────────────────
 
 def process_job(raw: str):
-    job       = json.loads(raw)
-    book_id   = job["book_id"]
-    chunk_idx = int(job["chunk_idx"])
-    total     = int(job["total"])
-    title     = job["title"]
+    job        = json.loads(raw)
+    book_id    = job["book_id"]
+    chunk_idx  = int(job["chunk_idx"])
+    total      = int(job["total"])
+    title      = job["title"]
     chunk_file = Path(job["chunk_file"])
+    speed      = float(job.get("speed", 1.0))
 
     start_time = time.time()
     JOB_START_TIME.labels(worker_id=WORKER_ID).set(start_time)
@@ -300,7 +319,6 @@ def process_job(raw: str):
         started_at=time.time(),
     )
 
-    # Read chunk text (prefer embedded payload, fall back to file)
     if not text:
         try:
             text = chunk_file.read_text(encoding="utf-8")
@@ -313,7 +331,7 @@ def process_job(raw: str):
             return
 
     try:
-        mp3_bytes, audio_dur = synthesize_text(text)
+        mp3_bytes, audio_dur = synthesize_text(text, speed_multiplier=speed)
         dest_path = save_mp3(book_id, chunk_idx, mp3_bytes)
 
         elapsed = time.time() - start_time
@@ -336,7 +354,7 @@ def process_job(raw: str):
         WORKER_LOGS.labels(worker_id=WORKER_ID, level="error").inc()
         log.error("└ chunk %d FAILED: %s", chunk_idx, exc)
         set_chunk_state(book_id, chunk_idx, status="error", error=str(exc))
-        # Continue — always increment so Merger can finalize remaining chunks.
+        # Always continue — increment so Merger can finalize remaining chunks.
 
     done, total_chunks = increment_done(book_id)
     log.info("  Progress: %d/%d chunks complete", done, total_chunks)
@@ -359,21 +377,23 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Eagerly warm up the model so the first chunk doesn't pay load time
+    # Warm up model before first job to avoid cold-start latency.
     try:
-        get_tts_engine()
+        get_engine()
     except Exception as exc:
-        log.warning("F5-TTS model pre-load failed (will retry on first job): %s", exc)
+        log.warning("ChatTTS model pre-load failed (will retry on first job): %s", exc)
 
     flush_thread = threading.Thread(target=spool_flush_loop, daemon=True, name="spool-flush")
     flush_thread.start()
 
-    prom_port = int(os.environ.get("PROMETHEUS_PORT", "8000"))
+    prom_port = int(os.environ.get("PROMETHEUS_PORT", "8004"))
     log.info("Starting Prometheus metrics server on port %d", prom_port)
     start_http_server(prom_port)
 
-    log.info("F5-TTS Worker %s ready — consuming %s", WORKER_ID, QUEUE_TTS)
-    log.info("Model: %s | Device: %s | Ref audio: %s", F5_MODEL, F5_DEVICE, F5_REF_AUDIO)
+    log.info("ChatTTS Worker %s ready — consuming %s", WORKER_ID, QUEUE_TTS)
+    log.info("Device: %s | Speed: %d | Temp: %.2f | Speaker seed: %d | Max chars: %d",
+             CHATTTS_DEVICE, CHATTTS_SPEED, CHATTTS_TEMPERATURE,
+             CHATTTS_SPEAKER_SEED, CHATTTS_MAX_CHARS)
     log.info("Output dir: %s | Spool dir: %s | Flush interval: %ds",
              OUTPUT_DIR, SPOOL_DIR, SMB_RETRY_INTERVAL)
 

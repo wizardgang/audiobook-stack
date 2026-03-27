@@ -63,6 +63,40 @@ services:
     depends_on:
       - abogen
 
+  chattts-worker:
+    build:
+      context: ./chattts-worker
+      dockerfile: Dockerfile
+    container_name: pipeline-chattts-worker
+    profiles:
+      - chattts-tts          # enable with COMPOSE_PROFILES=chattts-tts
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${CHATTTS_PROMETHEUS_PORT:-8004}:${CHATTTS_PROMETHEUS_PORT:-8004}"
+    environment:
+      - REDIS_URL=${REDIS_URL:?Set REDIS_URL to the main server Redis}
+      - WORKER_ID=${CHATTTS_WORKER_ID:-chattts-local-1}
+      - PROMETHEUS_PORT=${CHATTTS_PROMETHEUS_PORT:-8004}
+      - OUTPUT_DIR=/outputs
+      - SPOOL_DIR=/spool
+      - SMB_RETRY_INTERVAL=${SMB_RETRY_INTERVAL:-30}
+      - USE_GPU=${USE_GPU:-false}
+      - CHATTTS_DEVICE=${CHATTTS_DEVICE:-cpu}
+      - CHATTTS_SPEED=${CHATTTS_SPEED:-5}
+      - CHATTTS_TEMPERATURE=${CHATTTS_TEMPERATURE:-0.3}
+      - CHATTTS_TOP_P=${CHATTTS_TOP_P:-0.7}
+      - CHATTTS_TOP_K=${CHATTTS_TOP_K:-20}
+      - CHATTTS_SPEAKER_SEED=${CHATTTS_SPEAKER_SEED:-42}
+      - CHATTTS_MAX_CHARS=${CHATTTS_MAX_CHARS:-300}
+      - TZ=${TZ:-Africa/Nairobi}
+    volumes:
+      - ${OUTPUT_DIR:-./outputs}:/outputs
+      - chattts-spool:/spool
+      - chattts-models:/models
+
 volumes:
   worker-spool:
     # Local named volume — persists MP3s across container restarts while SMB is offline
+  chattts-spool:
+  chattts-models:
+    # Persists ChatTTS model weights across container rebuilds
