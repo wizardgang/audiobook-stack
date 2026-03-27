@@ -135,7 +135,16 @@ _GENRE_KEYWORDS: dict[Genre, list[str]] = {
     Genre.YA:          ["dream", "hope", "friend", "brave", "discover"],
 }
 
-_DIALOGUE_RE = re.compile(r'(?P<q>["\u201c\u201d])(?P<content>[^"\u201c\u201d]+)(?P=q)')
+# Matches dialogue quoted with straight (") or smart (\u201c / \u201d) quotes.
+# Smart quotes use DIFFERENT open/close code points so a backreference (?P=q)
+# would never match — we use an explicit alternation instead.
+_DIALOGUE_RE = re.compile(
+    r'(?:'
+    r'["\u201c](?P<content>[^"\u201c\u201d]+)["\u201d]'  # double: straight or curly
+    r'|'
+    r"['\u2018](?P<content2>[^'\u2018\u2019]+)['\u2019]"  # single: straight or curly
+    r')'
+)
 
 
 class AudiobookSSMLProcessor:
@@ -233,7 +242,8 @@ class AudiobookSSMLProcessor:
             return sent
 
         def _replace(m: re.Match) -> str:
-            content = m.group("content")
+            # group "content" = double-quoted, "content2" = single-quoted
+            content = m.group("content") or m.group("content2") or ""
             low = content.lower()
             if any(w in low for w in ["!", "scream", "shout", "yell"]):
                 return f'<prosody rate="fast" volume="loud">&#x201c;{self._esc(content)}&#x201d;</prosody>'
@@ -272,17 +282,17 @@ Task: Convert the supplied pre-normalized text into SSML that results in natural
 engaging audiobook narration. Do NOT alter any words — only add SSML tags.
 
 Valid tags (Kokoro-compatible subset):
-  <speak>          — root wrapper (required, exactly one)
-  <s>…</s>         — sentence boundary
-  <break time="Xs"/> — silence pause (X = float seconds)
+  <speak>            — root wrapper (required, exactly one)
+  <s>…</s>           — sentence boundary
+  <break time="Xs"/> — silence pause (X = float seconds, REQUIRED after every </s>)
   <emphasis level="moderate|strong|reduced"> — word/phrase stress
   <prosody rate="slow|fast|x-slow|x-fast" volume="soft|loud|medium"> — voice quality
 
 Rules:
 1. Wrap the entire output in a single <speak>…</speak> block.
-2. Wrap each sentence in <s>…</s> followed by a sentence-break.
-3. Add paragraph breaks between paragraphs.
-4. Detect dialogue (text inside " " or " "):
+2. Wrap each sentence in <s>…</s> and add <break time="{pause_s}s"/> immediately after every </s>.
+3. Add <break time="{pause_p}s"/> between paragraphs.
+4. Detect dialogue (text inside " " or \u201c \u201d):
    • whisper / soft / quiet → <prosody rate="slow" volume="soft">
    • shout / yell / scream / exclamation → <prosody rate="fast" volume="loud">
    • otherwise → <emphasis level="moderate">
@@ -293,6 +303,22 @@ Rules:
 
 Genre: {genre}
 Sentence pause: {pause_s}s   Paragraph pause: {pause_p}s   Chapter pause: {pause_c}s
+
+--- EXAMPLE ---
+Input:
+  \u201cI need to leave,\u201d she whispered. He stared at her. \u201cNow!\u201d he shouted.
+
+  The door slammed shut.
+
+Output:
+  <speak>
+  <s><prosody rate="slow" volume="soft">\u201cI need to leave,\u201d</prosody> she whispered.</s><break time="{pause_s}s"/>
+  <s>He stared at her.</s><break time="{pause_s}s"/>
+  <s><prosody rate="fast" volume="loud">\u201cNow!\u201d</prosody> he shouted.</s><break time="{pause_s}s"/>
+  <break time="{pause_p}s"/>
+  <s>The door slammed shut.</s><break time="{pause_s}s"/>
+  </speak>
+--- END EXAMPLE ---
 """
 
 _SSML_AI_TITLE_SYSTEM = """\
@@ -313,6 +339,7 @@ Escape & → &amp;  < → &lt;  > → &gt; inside text nodes.
 """
 
 _SSML_VALID_RE = re.compile(r"<speak[\s>]", re.IGNORECASE)
+_SSML_BREAK_RE = re.compile(r"<break\b", re.IGNORECASE)
 
 
 def _ai_generate_ssml(prompt_system: str, user_text: str) -> Optional[str]:
@@ -334,27 +361,35 @@ def _ai_generate_ssml(prompt_system: str, user_text: str) -> Optional[str]:
                 {"role": "user",   "content": user_text},
             ],
             max_tokens=4096,
-            temperature=0.2,   # slight creativity for natural variation; 0 = fully deterministic
+            temperature=0.2,
         )
         raw = (resp.choices[0].message.content or "").strip()
         elapsed = time.time() - t0
 
-        # Sanity-check: must look like SSML
+        # Strip accidental code fences the model may add despite instructions
+        raw = re.sub(r"^```(?:xml|ssml)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+
+        # Must contain a <speak> root
         if not _SSML_VALID_RE.search(raw):
-            log.warning("AI SSML response missing <speak> tag — falling back to rule-based")
+            log.warning("AI SSML missing <speak> tag — falling back to rule-based")
             ORCH_SSML_AI_CALLS.labels(status="invalid").inc()
             ORCH_SSML_AI_SECS.observe(elapsed)
             return None
 
-        # Strip accidental code fences the model may add despite instructions
-        raw = re.sub(r"^```(?:xml|ssml)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
+        # Must contain at least one <break> — if absent the model ignored the
+        # pause instructions and sentences will run together without silence.
+        if not _SSML_BREAK_RE.search(raw):
+            log.warning("AI SSML missing <break> tags — falling back to rule-based")
+            ORCH_SSML_AI_CALLS.labels(status="no_breaks").inc()
+            ORCH_SSML_AI_SECS.observe(elapsed)
+            return None
 
         ORCH_SSML_AI_CALLS.labels(status="success").inc()
         ORCH_AI_CALLS_TOTAL.labels(type="ssml", status="success").inc()
         ORCH_SSML_AI_SECS.observe(elapsed)
         ORCH_AI_DURATION_SECS.labels(type="ssml").observe(elapsed)
-        return raw.strip()
+        return raw
 
     except Exception as exc:
         elapsed = time.time() - t0
@@ -566,7 +601,7 @@ _default_skip = (
     "newsletter,mailing list,stay connected,"
 
     # ── Piracy watermarks ─────────────────────────────────────────────────────
-    "oceanofpd,ebookbike,ebook bike,ebookelo,ebook3000,"
+    "oceanofpdf,ebookbike,ebook bike,ebookelo,ebook3000,"
     "z-library,zlibrary,libgen,library genesis,freebookspot"
 )
 SKIP_CHAPTER_PATTERNS = [

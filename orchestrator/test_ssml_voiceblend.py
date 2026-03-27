@@ -220,27 +220,51 @@ class TestAudiobookSSMLProcessor:
 
     # ── dialogue processing ───────────────────────────────────────────────────
 
-    def test_dialogue_gets_emphasis(self):
+    # ── dialogue — straight quotes ────────────────────────────────────────────
+
+    def test_straight_quote_dialogue_gets_emphasis(self):
         proc = self._proc()
         ssml = proc.text_to_ssml('"Hello there," she said.')
         assert "<emphasis" in ssml or "<prosody" in ssml
 
-    def test_whisper_dialogue_gets_slow_prosody(self):
+    def test_straight_quote_whisper_gets_slow_prosody(self):
         proc = self._proc()
         ssml = proc.text_to_ssml('"I will whisper this," he said softly.')
         assert 'rate="slow"' in ssml
 
-    def test_shout_dialogue_gets_fast_prosody(self):
+    def test_straight_quote_shout_gets_fast_prosody(self):
         proc = self._proc()
         ssml = proc.text_to_ssml('"YELL AND SCREAM!" she shouted.')
         assert 'rate="fast"' in ssml
 
+    # ── dialogue — smart / curly quotes (the bug fix) ─────────────────────────
+
+    def test_smart_quote_dialogue_gets_emphasis(self):
+        """Curly open \u201c and close \u201d quotes must be detected as dialogue."""
+        proc = self._proc()
+        ssml = proc.text_to_ssml('\u201cHello there,\u201d she said.')
+        assert "<emphasis" in ssml or "<prosody" in ssml
+
+    def test_smart_quote_whisper_gets_slow_prosody(self):
+        proc = self._proc()
+        ssml = proc.text_to_ssml('\u201cI will whisper this,\u201d he said softly.')
+        assert 'rate="slow"' in ssml
+
+    def test_smart_quote_shout_gets_fast_prosody(self):
+        proc = self._proc()
+        ssml = proc.text_to_ssml('\u201cYELL AND SCREAM!\u201d she shouted.')
+        assert 'rate="fast"' in ssml
+
+    def test_mixed_quotes_both_detected(self):
+        """Both straight and smart quotes in the same sentence should be handled."""
+        proc = self._proc()
+        ssml = proc.text_to_ssml('"Hello," she said. \u201cGoodbye,\u201d he replied.')
+        assert ssml.count("<emphasis") + ssml.count("<prosody") >= 2
+
     def test_dialogue_disabled(self):
         proc = self._proc(emphasis_dialogue=False)
         ssml = proc.text_to_ssml('"Hello there," she said.')
-        # With emphasis_dialogue=False, no prosody/emphasis from dialogue
         assert "<prosody" not in ssml
-        # Note: keyword emphasis might still fire, so just check prosody
 
     # ── keyword emphasis ──────────────────────────────────────────────────────
 
@@ -403,6 +427,31 @@ class TestAIGenerateSSML:
              patch.object(orch, "ORCH_AI_DURATION_SECS", MagicMock()):
             result = orch._ai_generate_ssml("system prompt", "Hello world.")
         assert result is None
+
+    def test_ai_generate_ssml_missing_breaks_returns_none(self):
+        """SSML without any <break> tags must be rejected — sentences would run together."""
+        no_breaks = "<speak><s>Hello world.</s><s>Another sentence.</s></speak>"
+        with patch.object(orch, "AI_NORMALIZE", True), \
+             patch.object(orch, "_ai_client", self._mock_ai_response(no_breaks), create=True), \
+             patch.object(orch, "ORCH_SSML_AI_CALLS", MagicMock()), \
+             patch.object(orch, "ORCH_SSML_AI_SECS", MagicMock()), \
+             patch.object(orch, "ORCH_AI_CALLS_TOTAL", MagicMock()), \
+             patch.object(orch, "ORCH_AI_DURATION_SECS", MagicMock()):
+            result = orch._ai_generate_ssml("system prompt", "Hello world.")
+        assert result is None
+
+    def test_ai_generate_ssml_with_breaks_accepted(self):
+        """SSML that includes <break> tags must pass validation."""
+        with_breaks = '<speak><s>Hello.</s><break time="0.4s"/></speak>'
+        with patch.object(orch, "AI_NORMALIZE", True), \
+             patch.object(orch, "_ai_client", self._mock_ai_response(with_breaks), create=True), \
+             patch.object(orch, "ORCH_SSML_AI_CALLS", MagicMock()), \
+             patch.object(orch, "ORCH_SSML_AI_SECS", MagicMock()), \
+             patch.object(orch, "ORCH_AI_CALLS_TOTAL", MagicMock()), \
+             patch.object(orch, "ORCH_AI_DURATION_SECS", MagicMock()):
+            result = orch._ai_generate_ssml("system prompt", "Hello.")
+        assert result is not None
+        assert "<break" in result
 
     def test_ai_generate_ssml_strips_code_fences(self):
         fenced = "```xml\n" + _VALID_SSML + "\n```"
