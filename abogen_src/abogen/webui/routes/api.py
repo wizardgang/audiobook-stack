@@ -875,32 +875,37 @@ def api_generate_sync() -> ResponseReturnValue:
     
     payload = request.get_json(force=True, silent=True) or {}
     text = payload.get("text", "").strip()
-    
+
     if not text:
         return jsonify({"error": "Text is required"}), 400
-        
+
     voice = payload.get("voice", "")
     language = payload.get("language", "a")
     formatting = payload.get("format", "mp3")
-    
+    # Speed multiplier — orchestrator may set this via voice blend config
+    speed = float(payload.get("speed", 1.0))
+    # When True, text is already SSML; skip Kokoro text normalization
+    is_ssml = bool(payload.get("is_ssml", False))
+
     settings = load_settings()
     if not voice:
         voice = settings.get("default_voice", "af_sky")
-        
+
     if "use_gpu" in payload:
         use_gpu = coerce_bool(payload.get("use_gpu"), False)
     else:
         use_gpu = coerce_bool(settings.get("use_gpu"), False)
-    
+
     try:
         # Generate full chunk audio (set a high timeout, e.g. 1 hour)
         wav_bytes = generate_preview_audio(
             text=text,
             voice_spec=voice,
             language=language,
-            speed=1.0,
+            speed=speed,
             use_gpu=use_gpu,
-            max_seconds=3600.0, 
+            max_seconds=3600.0,
+            is_ssml=is_ssml,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500

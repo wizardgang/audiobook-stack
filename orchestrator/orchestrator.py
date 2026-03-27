@@ -14,6 +14,9 @@ import time
 import math
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
 import redis
 import fitz          # PyMuPDF
 from pathlib import Path
@@ -28,6 +31,454 @@ log = logging.getLogger(__name__)
 REDIS_URL        = os.environ.get("REDIS_URL",        "redis://localhost:6379")
 CHUNKS_DIR       = Path(os.environ.get("CHUNKS_DIR",  "/chunks"))
 CHUNK_SIZE_CHARS = int(os.environ.get("CHUNK_SIZE_CHARS", "3000"))
+
+# ── Kokoro Voice Blending ─────────────────────────────────────────────────────
+# Voice blend in "name:weight,name:weight" format, e.g. "af_bella:60,af_sky:40"
+# Also accepts the native formula format: "af_bella*0.6+af_sky*0.4"
+KOKORO_VOICE_BLEND = os.environ.get("KOKORO_VOICE_BLEND", "")
+KOKORO_SPEED       = float(os.environ.get("KOKORO_SPEED", "1.0"))
+
+# ── Kokoro SSML ───────────────────────────────────────────────────────────────
+KOKORO_SSML_ENABLED     = os.environ.get("KOKORO_SSML_ENABLED", "false").lower() == "true"
+# KOKORO_GENRE is the *fallback* when auto-detection is disabled or fails.
+# Valid values: fiction | romance | thriller | fantasy | non_fiction | ya
+KOKORO_GENRE            = os.environ.get("KOKORO_GENRE", "fiction")
+# When True (default), genre is inferred from the book title + opening text via AI.
+# Set to "false" to pin the genre using KOKORO_GENRE instead.
+KOKORO_GENRE_AUTO_DETECT = os.environ.get("KOKORO_GENRE_AUTO_DETECT", "true").lower() == "true"
+# When True, the AI model generates SSML markup instead of the rule-based fallback.
+# Requires OPENROUTER_API_KEY (same key used for text normalisation).
+KOKORO_SSML_AI_ENHANCED = os.environ.get("KOKORO_SSML_AI_ENHANCED", "false").lower() == "true"
+
+
+# ── Voice Blending ────────────────────────────────────────────────────────────
+
+def voice_blend_to_formula(blend: str) -> str:
+    """Convert colon-weight blend format to Kokoro formula.
+
+    Accepts two formats:
+      • "af_bella:60,af_sky:40"  → "af_bella*0.60+af_sky*0.40"
+      • "af_bella*0.6+af_sky*0.4" → returned as-is (already a formula)
+    Weights are normalized to sum to 1 automatically.
+    """
+    blend = blend.strip()
+    if not blend:
+        return ""
+    if "*" in blend:
+        # Already a Kokoro formula — pass through
+        return blend
+    parts = []
+    total_weight = 0.0
+    segments = []
+    for segment in blend.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if ":" in segment:
+            voice, raw_w = segment.rsplit(":", 1)
+            voice = voice.strip()
+            try:
+                w = float(raw_w.strip())
+            except ValueError:
+                raise ValueError(f"Invalid weight for voice '{voice}': '{raw_w}'")
+        else:
+            voice, w = segment, 100.0
+        if w <= 0:
+            raise ValueError(f"Weight for '{voice}' must be positive")
+        segments.append((voice, w))
+        total_weight += w
+
+    if total_weight <= 0:
+        raise ValueError("Voice blend weights must sum to a positive value")
+
+    for voice, w in segments:
+        parts.append(f"{voice}*{w / total_weight:.4f}")
+    return "+".join(parts)
+
+
+# ── SSML Generation ───────────────────────────────────────────────────────────
+
+class Genre(Enum):
+    FICTION     = "fiction"
+    ROMANCE     = "romance"
+    THRILLER    = "thriller"
+    FANTASY     = "fantasy"
+    NON_FICTION = "non_fiction"
+    YA          = "young_adult"
+
+
+@dataclass
+class SSMLConfig:
+    """Configuration for SSML generation in the Kokoro pipeline."""
+    genre: Genre = Genre.FICTION
+
+    # Pause durations in seconds
+    pause_sentence: float  = 0.4
+    pause_paragraph: float = 0.7
+    pause_chapter: float   = 1.2
+
+    # Emphasis toggles
+    emphasis_chapter_titles: bool = True
+    emphasis_dialogue: bool       = True
+    emphasis_keywords: bool       = True
+
+
+_GENRE_KEYWORDS: dict[Genre, list[str]] = {
+    Genre.THRILLER:    ["suddenly", "dead", "kill", "murder", "blood",
+                        "scream", "danger", "secret", "dark", "shadow"],
+    Genre.ROMANCE:     ["love", "heart", "kiss", "forever", "beautiful",
+                        "passion", "desire", "whisper", "tender"],
+    Genre.FANTASY:     ["magic", "dragon", "power", "ancient", "spell",
+                        "wizard", "kingdom", "quest", "destiny"],
+    Genre.NON_FICTION: ["important", "remember", "key", "essential",
+                        "critical", "fundamental", "significant"],
+    Genre.YA:          ["dream", "hope", "friend", "brave", "discover"],
+}
+
+_DIALOGUE_RE = re.compile(r'(?P<q>["\u201c\u201d])(?P<content>[^"\u201c\u201d]+)(?P=q)')
+
+
+class AudiobookSSMLProcessor:
+    """Wraps pre-normalized text in SSML suitable for Kokoro TTS.
+
+    Normalization (numbers, abbreviations, etc.) is expected to have already
+    happened upstream.  This class adds structural SSML markup:
+    pauses, sentence tags, dialogue prosody, and genre keyword emphasis.
+
+    When *ai_enhanced* is True (and an AI client is configured) each chunk is
+    sent to the AI model for richer, context-aware SSML generation.  The
+    rule-based path acts as an automatic fallback on any AI failure.
+    """
+
+    def __init__(self, config: Optional[SSMLConfig] = None, ai_enhanced: bool = False):
+        self.config = config or SSMLConfig()
+        self.ai_enhanced = ai_enhanced
+        self._keywords = _GENRE_KEYWORDS.get(self.config.genre, [])
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def chapter_title_to_ssml(self, title: str) -> str:
+        """Wrap a chapter title with emphasis and surrounding pauses."""
+        if self.ai_enhanced:
+            system = _SSML_AI_TITLE_SYSTEM.format(
+                genre=self.config.genre.value,
+                pause_c=self.config.pause_chapter,
+            )
+            result = _ai_generate_ssml(system, title)
+            if result:
+                return result
+            log.debug("AI chapter-title SSML failed; using rule-based fallback")
+
+        cfg = self.config
+        return (
+            f'<speak>'
+            f'<break time="{cfg.pause_chapter}s"/>'
+            f'<emphasis level="strong">{self._esc(title)}</emphasis>'
+            f'<break time="{cfg.pause_chapter}s"/>'
+            f'</speak>'
+        )
+
+    def text_to_ssml(self, text: str) -> str:
+        """Convert a pre-normalized text chunk to SSML.
+
+        When ai_enhanced=True, calls the AI model first and falls back to the
+        rule-based implementation if the AI call fails or returns invalid output.
+        """
+        if self.ai_enhanced:
+            system = _SSML_AI_SYSTEM.format(
+                genre=self.config.genre.value,
+                pause_s=self.config.pause_sentence,
+                pause_p=self.config.pause_paragraph,
+                pause_c=self.config.pause_chapter,
+            )
+            result = _ai_generate_ssml(system, text)
+            if result:
+                return result
+            log.debug("AI SSML failed; using rule-based fallback")
+
+        return self._rule_based_ssml(text)
+
+    # ── rule-based implementation ─────────────────────────────────────────────
+
+    def _rule_based_ssml(self, text: str) -> str:
+        """Deterministic, regex-based SSML generation (no AI call)."""
+        cfg = self.config
+        paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+        parts = ["<speak>"]
+        for i, para in enumerate(paragraphs):
+            parts.append(self._para_to_ssml(para))
+            if i < len(paragraphs) - 1:
+                parts.append(f'<break time="{cfg.pause_paragraph}s"/>')
+        parts.append("</speak>")
+        return "\n".join(parts)
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _para_to_ssml(self, para: str) -> str:
+        cfg = self.config
+        sentences = re.split(r'(?<=[.!?])\s+', para)
+        out = []
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            sent = self._process_dialogue(sent)
+            if cfg.emphasis_keywords and self._keywords:
+                sent = self._add_keyword_emphasis(sent)
+            out.append(f'<s>{sent}</s><break time="{cfg.pause_sentence}s"/>')
+        return "\n".join(out)
+
+    def _process_dialogue(self, sent: str) -> str:
+        if not self.config.emphasis_dialogue:
+            return sent
+
+        def _replace(m: re.Match) -> str:
+            content = m.group("content")
+            low = content.lower()
+            if any(w in low for w in ["!", "scream", "shout", "yell"]):
+                return f'<prosody rate="fast" volume="loud">&#x201c;{self._esc(content)}&#x201d;</prosody>'
+            elif any(w in low for w in ["whisper", "quiet", "soft"]):
+                return f'<prosody rate="slow" volume="soft">&#x201c;{self._esc(content)}&#x201d;</prosody>'
+            else:
+                return f'<emphasis level="moderate">&#x201c;{self._esc(content)}&#x201d;</emphasis>'
+
+        return _DIALOGUE_RE.sub(_replace, sent)
+
+    def _add_keyword_emphasis(self, sent: str) -> str:
+        for kw in self._keywords:
+            sent = re.sub(
+                rf'\b({re.escape(kw)})\b',
+                r'<emphasis level="moderate">\1</emphasis>',
+                sent,
+                flags=re.IGNORECASE,
+            )
+        return sent
+
+    @staticmethod
+    def _esc(text: str) -> str:
+        """Minimal XML escaping for SSML content."""
+        return (text
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
+# ── AI-enhanced SSML generation ───────────────────────────────────────────────
+
+_SSML_AI_SYSTEM = """\
+You are an audiobook narration specialist that produces SSML markup for Kokoro TTS.
+
+Task: Convert the supplied pre-normalized text into SSML that results in natural,
+engaging audiobook narration. Do NOT alter any words — only add SSML tags.
+
+Valid tags (Kokoro-compatible subset):
+  <speak>          — root wrapper (required, exactly one)
+  <s>…</s>         — sentence boundary
+  <break time="Xs"/> — silence pause (X = float seconds)
+  <emphasis level="moderate|strong|reduced"> — word/phrase stress
+  <prosody rate="slow|fast|x-slow|x-fast" volume="soft|loud|medium"> — voice quality
+
+Rules:
+1. Wrap the entire output in a single <speak>…</speak> block.
+2. Wrap each sentence in <s>…</s> followed by a sentence-break.
+3. Add paragraph breaks between paragraphs.
+4. Detect dialogue (text inside " " or " "):
+   • whisper / soft / quiet → <prosody rate="slow" volume="soft">
+   • shout / yell / scream / exclamation → <prosody rate="fast" volume="loud">
+   • otherwise → <emphasis level="moderate">
+5. Emphasize emotionally significant words appropriate to the genre.
+6. Preserve all original words exactly — no paraphrasing.
+7. Escape & → &amp;  < → &lt;  > → &gt; inside text nodes.
+8. Return ONLY the SSML — no explanation, no code fences.
+
+Genre: {genre}
+Sentence pause: {pause_s}s   Paragraph pause: {pause_p}s   Chapter pause: {pause_c}s
+"""
+
+_SSML_AI_TITLE_SYSTEM = """\
+You are an audiobook narration specialist producing SSML for Kokoro TTS.
+
+Task: Wrap the given chapter title in an SSML block that delivers it with emphasis
+and appropriate surrounding pauses. Return ONLY the SSML — no explanation.
+
+Output format (fill in pauses and title text):
+<speak>
+<break time="{pause_c}s"/>
+<emphasis level="strong">TITLE HERE</emphasis>
+<break time="{pause_c}s"/>
+</speak>
+
+Genre: {genre}   Chapter pause: {pause_c}s
+Escape & → &amp;  < → &lt;  > → &gt; inside text nodes.
+"""
+
+_SSML_VALID_RE = re.compile(r"<speak[\s>]", re.IGNORECASE)
+
+
+def _ai_generate_ssml(prompt_system: str, user_text: str) -> Optional[str]:
+    """
+    Call the AI model to generate SSML for *user_text*.
+
+    Returns the SSML string on success, or None on any failure so the
+    caller can fall back to rule-based generation.
+    Metrics are recorded for every attempt.
+    """
+    if not AI_NORMALIZE:
+        return None  # AI client not configured
+    t0 = time.time()
+    try:
+        resp = _ai_client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": prompt_system},
+                {"role": "user",   "content": user_text},
+            ],
+            max_tokens=4096,
+            temperature=0.2,   # slight creativity for natural variation; 0 = fully deterministic
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        elapsed = time.time() - t0
+
+        # Sanity-check: must look like SSML
+        if not _SSML_VALID_RE.search(raw):
+            log.warning("AI SSML response missing <speak> tag — falling back to rule-based")
+            ORCH_SSML_AI_CALLS.labels(status="invalid").inc()
+            ORCH_SSML_AI_SECS.observe(elapsed)
+            return None
+
+        # Strip accidental code fences the model may add despite instructions
+        raw = re.sub(r"^```(?:xml|ssml)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        ORCH_SSML_AI_CALLS.labels(status="success").inc()
+        ORCH_AI_CALLS_TOTAL.labels(type="ssml", status="success").inc()
+        ORCH_SSML_AI_SECS.observe(elapsed)
+        ORCH_AI_DURATION_SECS.labels(type="ssml").observe(elapsed)
+        return raw.strip()
+
+    except Exception as exc:
+        elapsed = time.time() - t0
+        ORCH_SSML_AI_CALLS.labels(status="error").inc()
+        ORCH_AI_CALLS_TOTAL.labels(type="ssml", status="error").inc()
+        ORCH_SSML_AI_SECS.observe(elapsed)
+        log.warning("AI SSML generation failed (%s) — falling back to rule-based", exc)
+        return None
+
+
+_GENRE_DETECT_SYSTEM = """\
+You are a book genre classifier for an audiobook TTS pipeline.
+
+Given a book title and a short excerpt from the opening, output EXACTLY one of
+these genre labels — nothing else, no explanation, no punctuation:
+
+  fiction | romance | thriller | fantasy | non_fiction | ya
+
+Definitions:
+  fiction     – general/literary fiction, historical fiction, mystery, horror,
+                science fiction, contemporary fiction
+  romance     – stories where the central plot is a romantic relationship
+  thriller    – suspense, action, crime, spy, legal, political thrillers
+  fantasy     – epic/high fantasy, urban fantasy, fairy tales, mythology
+  non_fiction – biography, memoir, self-help, history, science, business
+  ya          – Young Adult (teen protagonists, coming-of-age)
+
+If genuinely ambiguous, pick the single best-matching label.
+"""
+
+_GENRE_LABEL_MAP: dict[str, Genre] = {
+    "fiction":     Genre.FICTION,
+    "romance":     Genre.ROMANCE,
+    "thriller":    Genre.THRILLER,
+    "fantasy":     Genre.FANTASY,
+    "non_fiction": Genre.NON_FICTION,
+    "non-fiction": Genre.NON_FICTION,
+    "ya":          Genre.YA,
+    "young_adult": Genre.YA,
+}
+
+
+def detect_book_genre(book_title: str, chapters: list) -> Genre:
+    """Infer the book's genre from its title and opening text using the AI model.
+
+    Samples up to 800 chars from the first non-trivial chapter body so the
+    prompt stays small (≤ ~250 input tokens).
+
+    Falls back to the KOKORO_GENRE env-var default on any failure.
+    """
+    fallback_genre = _GENRE_LABEL_MAP.get(KOKORO_GENRE.lower(), Genre.FICTION)
+
+    if not AI_NORMALIZE or not KOKORO_GENRE_AUTO_DETECT:
+        return fallback_genre
+
+    # Build a compact sample: title + first chapter title + opening excerpt
+    sample_lines = [f"Title: {book_title}"]
+    for ch in chapters[:3]:
+        ch_title = ch.get("title", "").strip()
+        ch_text  = (ch.get("text") or "").strip()[:800]
+        if ch_title:
+            sample_lines.append(f"Chapter: {ch_title}")
+        if ch_text:
+            sample_lines.append(ch_text)
+            break  # one chapter excerpt is enough
+
+    sample = "\n".join(sample_lines)
+
+    t0 = time.time()
+    try:
+        resp = _ai_client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": _GENRE_DETECT_SYSTEM},
+                {"role": "user",   "content": sample},
+            ],
+            max_tokens=10,   # we only need one word back
+            temperature=0.0,
+        )
+        raw_label = (resp.choices[0].message.content or "").strip().lower()
+        genre = _GENRE_LABEL_MAP.get(raw_label)
+
+        if genre is None:
+            log.warning("Genre detection returned unknown label '%s' — using fallback '%s'",
+                        raw_label, fallback_genre.value)
+            ORCH_GENRE_DETECT.labels(genre="unknown", status="fallback").inc()
+            ORCH_AI_CALLS_TOTAL.labels(type="genre_detect", status="fallback").inc()
+            return fallback_genre
+
+        elapsed = time.time() - t0
+        log.info("  Genre detected: %s (%.2fs)", genre.value, elapsed)
+        ORCH_GENRE_DETECT.labels(genre=genre.value, status="success").inc()
+        ORCH_AI_CALLS_TOTAL.labels(type="genre_detect", status="success").inc()
+        ORCH_AI_DURATION_SECS.labels(type="genre_detect").observe(elapsed)
+        return genre
+
+    except Exception as exc:
+        log.warning("Genre detection failed (%s) — using fallback '%s'", exc, fallback_genre.value)
+        ORCH_GENRE_DETECT.labels(genre=fallback_genre.value, status="error").inc()
+        ORCH_AI_CALLS_TOTAL.labels(type="genre_detect", status="error").inc()
+        return fallback_genre
+
+
+def _build_ssml_processor(genre: Optional[Genre] = None) -> Optional[AudiobookSSMLProcessor]:
+    """Return an SSMLProcessor configured from env vars (and optional detected genre).
+
+    *genre* — pass the result of ``detect_book_genre()`` to use a per-book
+    genre instead of the global KOKORO_GENRE default.  When None the env-var
+    default is used.
+
+    When KOKORO_SSML_AI_ENHANCED=true (and OPENROUTER_API_KEY is set) the
+    processor will use the AI model for SSML markup; falls back to rule-based
+    on any AI failure.
+    """
+    if not KOKORO_SSML_ENABLED:
+        return None
+    if genre is None:
+        genre_map = {g.value: g for g in Genre}
+        genre = genre_map.get(KOKORO_GENRE.lower(), Genre.FICTION)
+    ai_enhanced = KOKORO_SSML_AI_ENHANCED and AI_NORMALIZE
+    if ai_enhanced:
+        log.info("SSML AI-enhanced mode enabled (model=%s, genre=%s)", OPENROUTER_MODEL, genre.value)
+    return AudiobookSSMLProcessor(SSMLConfig(genre=genre), ai_enhanced=ai_enhanced)
+
 
 # ── Prometheus Metrics ────────────────────────────────────────────────────────
 ORCH_BOOKS_TOTAL      = Counter('pipeline_orchestrator_books_total',
@@ -54,6 +505,13 @@ ORCH_QUEUE_DEPTH      = Gauge('pipeline_queue_tts_depth',
                                'Current TTS queue depth (live)')
 ORCH_WATCHDOG_TOTAL   = Counter('pipeline_orchestrator_watchdog_resurrections_total',
                                 'Ghost chunks re-queued by the watchdog')
+ORCH_SSML_AI_CALLS    = Counter('pipeline_orchestrator_ssml_ai_calls_total',
+                                'AI SSML generation calls', ['status'])
+ORCH_SSML_AI_SECS     = Histogram('pipeline_orchestrator_ssml_ai_seconds',
+                                  'AI SSML generation latency per chunk',
+                                  buckets=[0.2, 0.5, 1, 2, 5, 10, 30])
+ORCH_GENRE_DETECT     = Counter('pipeline_orchestrator_genre_detect_total',
+                                'Genre auto-detection outcomes', ['genre', 'status'])
 
 # Chapters whose titles match any of these patterns (case-insensitive) are skipped.
 # Override via env: SKIP_CHAPTERS="copyright,acknowledgment,about the author,bibliography"
@@ -108,7 +566,7 @@ _default_skip = (
     "newsletter,mailing list,stay connected,"
 
     # ── Piracy watermarks ─────────────────────────────────────────────────────
-    "oceanofpdf,ebookbike,ebook bike,ebookelo,ebook3000,"
+    "oceanofpd,ebookbike,ebook bike,ebookelo,ebook3000,"
     "z-library,zlibrary,libgen,library genesis,freebookspot"
 )
 SKIP_CHAPTER_PATTERNS = [
@@ -468,6 +926,25 @@ def process_job(raw: str):
     book_id  = job["id"]
     pdf_path = Path(job["path"])
 
+    # Resolve voice blend formula and SSML processor for this job.
+    # Per-job overrides take precedence over env-var defaults.
+    voice_blend_raw = job.get("voice_blend", KOKORO_VOICE_BLEND)
+    try:
+        voice_formula = voice_blend_to_formula(voice_blend_raw) if voice_blend_raw else ""
+    except ValueError as e:
+        log.warning("Invalid KOKORO_VOICE_BLEND '%s': %s — using default voice", voice_blend_raw, e)
+        voice_formula = ""
+
+    tts_speed = float(job.get("speed", KOKORO_SPEED))
+
+    ssml_enabled = job.get("ssml_enabled", KOKORO_SSML_ENABLED)
+    # Genre and SSML processor are resolved after extraction so detect_book_genre
+    # has access to the chapter list. Placeholders set here.
+    ssml_proc = None
+
+    if voice_formula:
+        log.info("  Voice blend formula: %s", voice_formula)
+
     log.info("Processing book %s — %s", book_id[:8], pdf_path.name)
 
     set_book_state(book_id,
@@ -496,6 +973,14 @@ def process_job(raw: str):
             tts_chunks = math.ceil(chars / CHUNK_SIZE_CHARS) if chars else 0
             log.info("    [%3d] %-50s  %7d chars  -> ~%d TTS chunk(s)",
                      i + 1, title[:50], chars, tts_chunks)
+
+        # Auto-detect genre from title + opening text, then build the SSML processor.
+        if ssml_enabled:
+            detected_genre = detect_book_genre(pdf_path.stem, chapters)
+            ssml_proc = _build_ssml_processor(genre=detected_genre)
+            log.info("  SSML enabled (genre=%s, ai_enhanced=%s)",
+                     detected_genre.value, ssml_proc.ai_enhanced if ssml_proc else False)
+
     except Exception as exc:
         log.error("API Text extraction failed: %s", exc)
         set_book_state(book_id, status="error", error=str(exc))
@@ -530,6 +1015,7 @@ def process_job(raw: str):
             chunk_file.write_text(c_text, encoding="utf-8")
 
             title = ch_title if len(ch_chunks) == 1 else f"{ch_title} - Part {part_idx + 1}"
+            is_first_part = part_idx == 0
             chunk_job = {
                 "book_id": book_id,
                 "chunk_idx": global_chunk_idx,
@@ -537,7 +1023,12 @@ def process_job(raw: str):
                 "chapter_title": ch_title,
                 "title": title,
                 "text": c_text,
-                "chunk_file": str(chunk_file)
+                "chunk_file": str(chunk_file),
+                # Kokoro voice blend & SSML metadata
+                "voice": voice_formula,
+                "speed": tts_speed,
+                "is_ssml": bool(ssml_proc),
+                "is_chapter_start": is_first_part,
             }
             chapter_metadata.append(chunk_job)
             global_chunk_idx += 1
@@ -565,6 +1056,24 @@ def process_job(raw: str):
                     log.info("  Normalized %d/%d chunks", completed, total)
 
         log.info("  AI normalization complete.")
+
+    # SSML conversion — wrap normalized text in SSML markup for Kokoro
+    if ssml_proc and chapter_metadata:
+        log.info("  Applying SSML markup to %d chunks...", total)
+        for meta in chapter_metadata:
+            is_chapter_start = meta.get("is_chapter_start", False)
+            if is_chapter_start:
+                # Prepend a chapter-title SSML block before the content
+                title_ssml = ssml_proc.chapter_title_to_ssml(meta["chapter_title"])
+                content_ssml = ssml_proc.text_to_ssml(meta["text"])
+                # Strip the outer <speak> from content and merge into one document
+                inner = content_ssml.replace("<speak>\n", "").replace("<speak>", "").replace("\n</speak>", "").replace("</speak>", "")
+                merged = f"<speak>\n{title_ssml.replace('<speak>', '').replace('</speak>', '')}\n{inner}\n</speak>"
+                meta["text"] = merged
+            else:
+                meta["text"] = ssml_proc.text_to_ssml(meta["text"])
+            Path(meta["chunk_file"]).write_text(meta["text"], encoding="utf-8")
+        log.info("  SSML markup applied.")
 
     # Save a metadata file so the merger knows the chapter mapping
     meta_file = book_chunks_dir / "meta.json"

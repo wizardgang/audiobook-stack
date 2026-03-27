@@ -163,17 +163,28 @@ def increment_done(book_id: str) -> tuple[int, int]:
     return done, total
 
 
-def call_abogen(text: str, title: str, chunk_idx: int) -> bytes:
+def call_abogen(text: str, title: str, chunk_idx: int,
+                voice: str = "", speed: float = 1.0, is_ssml: bool = False) -> bytes:
     """
     POST text to the abogen /api/generate endpoint with infinite resilient backoff.
     Returns raw MP3 bytes.
+
+    Args:
+        voice:   Kokoro voice formula, e.g. "af_bella*0.6+af_sky*0.4". Empty string
+                 means use the abogen server's configured default voice.
+        speed:   Speech rate multiplier (1.0 = normal).
+        is_ssml: When True the text is already SSML — abogen skips re-normalization.
     """
     payload = {
-        "text":   text,
-        "title":  f"{title} - part {chunk_idx:04d}",
-        "format": "mp3",
+        "text":    text,
+        "title":   f"{title} - part {chunk_idx:04d}",
+        "format":  "mp3",
         "use_gpu": os.environ.get("USE_GPU", "false").lower() == "true",
+        "speed":   speed,
+        "is_ssml": is_ssml,
     }
+    if voice:
+        payload["voice"] = voice
     
     retry_delay = 5
     max_retries = 5
@@ -224,10 +235,15 @@ def process_job(raw: str):
     total     = int(job["total"])
     title     = job["title"]
     chunk_file = Path(job["chunk_file"])
-    
+
+    # Kokoro voice blend & SSML settings (set by orchestrator; optional for older jobs)
+    voice   = job.get("voice", "")
+    speed   = float(job.get("speed", 1.0))
+    is_ssml = bool(job.get("is_ssml", False))
+
     start_time = time.time()
     JOB_START_TIME.labels(worker_id=WORKER_ID).set(start_time)
-    
+
     # Extract the text directly from the Redis payload (bypassing file syncing)
     # If using older orchestrated jobs, fallback securely to disk
     text = job.get("text")
@@ -253,7 +269,7 @@ def process_job(raw: str):
 
     # Call abogen
     try:
-        mp3_bytes = call_abogen(text, title, chunk_idx)
+        mp3_bytes = call_abogen(text, title, chunk_idx, voice=voice, speed=speed, is_ssml=is_ssml)
 
         # Write output MP3 (falls back to local spool if OUTPUT_DIR is offline)
         dest_path = save_mp3(book_id, chunk_idx, mp3_bytes)
