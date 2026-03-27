@@ -1098,9 +1098,15 @@ def process_job(raw: str):
         for meta in chapter_metadata:
             is_chapter_start = meta.get("is_chapter_start", False)
             if is_chapter_start:
-                # Prepend a chapter-title SSML block before the content
+                # Prepend a chapter-title SSML block before the content.
+                # Strip the chapter title from the start of the body text so it
+                # is not rendered twice (once as emphasis, once as a plain <s>).
                 title_ssml = ssml_proc.chapter_title_to_ssml(meta["chapter_title"])
-                content_ssml = ssml_proc.text_to_ssml(meta["text"])
+                body_text = meta["text"].lstrip()
+                title_norm = meta["chapter_title"].strip().lower()
+                if body_text.lower().startswith(title_norm):
+                    body_text = body_text[len(title_norm):].lstrip(" \t\r\n:.")
+                content_ssml = ssml_proc.text_to_ssml(body_text)
                 # Strip the outer <speak> from content and merge into one document
                 inner = content_ssml.replace("<speak>\n", "").replace("<speak>", "").replace("\n</speak>", "").replace("</speak>", "")
                 merged = f"<speak>\n{title_ssml.replace('<speak>', '').replace('</speak>', '')}\n{inner}\n</speak>"

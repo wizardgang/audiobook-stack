@@ -725,3 +725,91 @@ class TestVoiceBlendIntegration:
         ]:
             formula = orch.voice_blend_to_formula(blend)
             assert "+" in formula or formula.count("*") == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chapter title deduplication in SSML merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestChapterTitleDeduplication:
+    """Verify that the chapter title is not rendered twice when is_chapter_start=True."""
+
+    def _make_processor(self):
+        return orch.AudiobookSSMLProcessor(
+            config=orch.SSMLConfig(genre=orch.Genre.FICTION),
+            ai_enhanced=False,
+        )
+
+    def test_title_stripped_when_body_starts_with_it(self):
+        """If body text starts with the chapter title, it should not appear as a plain <s>."""
+        proc = self._make_processor()
+        chapter_title = "Chapter Nineteen"
+        body_text = "Chapter Nineteen\nAdam and Grace are throwing a party."
+
+        # Simulate the deduplication logic from orchestrator
+        body = body_text.lstrip()
+        title_norm = chapter_title.strip().lower()
+        if body.lower().startswith(title_norm):
+            body = body[len(title_norm):].lstrip(" \t\r\n:.")
+
+        title_ssml = proc.chapter_title_to_ssml(chapter_title)
+        content_ssml = proc.text_to_ssml(body)
+
+        # Merge as the orchestrator does
+        inner = content_ssml.replace("<speak>\n", "").replace("<speak>", "").replace("\n</speak>", "").replace("</speak>", "")
+        merged = f"<speak>\n{title_ssml.replace('<speak>', '').replace('</speak>', '')}\n{inner}\n</speak>"
+
+        # Title should appear exactly once (as emphasis, not as a plain sentence)
+        assert merged.count("Chapter Nineteen") == 1
+        assert "<emphasis" in merged
+        # The plain sentence form should not be present
+        assert "<s>Chapter Nineteen</s>" not in merged
+
+    def test_title_not_stripped_when_body_differs(self):
+        """If body text does not start with the chapter title, nothing is removed."""
+        chapter_title = "Chapter One"
+        body_text = "It was a dark and stormy night."
+
+        body = body_text.lstrip()
+        title_norm = chapter_title.strip().lower()
+        if body.lower().startswith(title_norm):
+            body = body[len(title_norm):].lstrip(" \t\r\n:.")
+
+        assert body == body_text
+
+    def test_title_stripped_case_insensitive(self):
+        """Stripping is case-insensitive to handle varying capitalisation."""
+        chapter_title = "CHAPTER TWENTY"
+        body_text = "Chapter Twenty\nThe story continues."
+
+        body = body_text.lstrip()
+        title_norm = chapter_title.strip().lower()
+        if body.lower().startswith(title_norm):
+            body = body[len(title_norm):].lstrip(" \t\r\n:.")
+
+        assert not body.lower().startswith("chapter twenty")
+        assert "The story continues." in body
+
+    def test_title_stripped_with_colon_separator(self):
+        """Common pattern: 'Chapter One: The Beginning' — colon/dot stripped too."""
+        chapter_title = "Chapter One"
+        body_text = "Chapter One: The Beginning\nSome text here."
+
+        body = body_text.lstrip()
+        title_norm = chapter_title.strip().lower()
+        if body.lower().startswith(title_norm):
+            body = body[len(title_norm):].lstrip(" \t\r\n:.")
+
+        assert body.startswith("The Beginning")
+
+    def test_empty_body_after_stripping(self):
+        """If the body is only the title, stripping leaves an empty string — no crash."""
+        chapter_title = "Prologue"
+        body_text = "Prologue"
+
+        body = body_text.lstrip()
+        title_norm = chapter_title.strip().lower()
+        if body.lower().startswith(title_norm):
+            body = body[len(title_norm):].lstrip(" \t\r\n:.")
+
+        assert body == ""
