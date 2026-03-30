@@ -82,6 +82,43 @@ CHATTTS_DEVICE      = os.environ.get(
     "CHATTTS_DEVICE",
     "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu",
 )
+# Emotion / prosody preset injected into RefineTextParams.prompt.
+# Tokens: [oral_0-9]  conversational style (0=formal, 9=very casual)
+#         [laugh_0-2] laughter insertion   (0=none, 2=frequent)
+#         [break_0-7] pause length         (0=none, 7=very long)
+# Built-in presets (or pass a raw token string, e.g. "[oral_4][laugh_1][break_3]"):
+#   narrator   — clear, measured audiobook narration (default)
+#   neutral    — balanced, no strong style
+#   calm       — slow and measured
+#   serious    — formal, no laughter
+#   happy      — upbeat and cheerful
+#   excited    — energetic, fast paced
+#   sad        — heavy, long pauses
+#   dramatic   — theatrical, punchy
+CHATTTS_EMOTION = os.environ.get("CHATTTS_EMOTION", "narrator")
+
+_EMOTION_PRESETS: dict[str, str] = {
+    "narrator":  "[oral_2][laugh_0][break_5]",
+    "neutral":   "[oral_2][laugh_0][break_4]",
+    "calm":      "[oral_1][laugh_0][break_6]",
+    "serious":   "[oral_0][laugh_0][break_4]",
+    "happy":     "[oral_5][laugh_2][break_3]",
+    "excited":   "[oral_7][laugh_1][break_2]",
+    "sad":       "[oral_0][laugh_0][break_7]",
+    "dramatic":  "[oral_3][laugh_0][break_3]",
+}
+
+
+def _resolve_emotion(emotion: str) -> str:
+    """Return the refine-text prompt token string for the given emotion name or
+    raw token string. Falls back to 'narrator' if the preset is unrecognised."""
+    if emotion in _EMOTION_PRESETS:
+        return _EMOTION_PRESETS[emotion]
+    # Allow raw token strings like "[oral_4][laugh_1][break_3]"
+    if emotion.startswith("["):
+        return emotion
+    log.warning("Unknown emotion preset '%s' — falling back to 'narrator'", emotion)
+    return _EMOTION_PRESETS["narrator"]
 
 # ChatTTS outputs 24 kHz PCM float32
 CHATTTS_SAMPLE_RATE = 24000
@@ -338,13 +375,14 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
     segments  = _split_text(text, CHATTTS_MAX_CHARS)
     speed_int = _job_speed_to_token(speed_multiplier)
 
+    emotion_tokens = _resolve_emotion(CHATTTS_EMOTION)
     log.info(
-        "  Text: %d chars → %d segment(s)  [speed_%d]",
-        len(text), len(segments), speed_int,
+        "  Text: %d chars → %d segment(s)  [speed_%d]  emotion=%s %s",
+        len(text), len(segments), speed_int, CHATTTS_EMOTION, emotion_tokens,
     )
 
     # Speed is injected via the [speed_N] prompt token inside InferCodeParams.
-    # RefineTextParams controls prosody naturalness via oral/break/laugh tokens.
+    # Emotion/prosody is injected via oral/laugh/break tokens in RefineTextParams.
     params_infer = ChatTTS.Chat.InferCodeParams(
         spk_emb=spk_emb,
         prompt=f"[speed_{speed_int}]",
@@ -353,7 +391,7 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
         top_K=CHATTTS_TOP_K,
     )
     params_refine = ChatTTS.Chat.RefineTextParams(
-        prompt="[oral_2][laugh_0][break_4]",
+        prompt=emotion_tokens,
     )
 
     audio_parts: list[np.ndarray] = []

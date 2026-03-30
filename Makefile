@@ -73,17 +73,37 @@ speak:
 	|| echo "ERROR: abogen API call failed — is the abogen container running?"
 
 speak-chattts:
-	@test -n "$(TEXT)$(FILE)" || (echo "Usage: make speak-chattts TEXT='...'  or  make speak-chattts FILE=path/to/file.txt"; exit 1)
+	@test -n "$(TEXT)$(FILE)" || (echo "Usage: make speak-chattts TEXT='...' [EMOTION=narrator|calm|happy|excited|sad|serious|dramatic]  or  FILE=path/to/file.txt"; exit 1)
 	@TEXT_CONTENT=$$([ -n "$(FILE)" ] && cat "$(FILE)" || printf '%s' "$(TEXT)"); \
-	docker exec pipeline-chattts-worker python /app/speak.py "$$TEXT_CONTENT" /tmp/tts-test.mp3 \
+	docker exec \
+	  -e CHATTTS_EMOTION=$(or $(EMOTION),narrator) \
+	  pipeline-chattts-worker \
+	  python /app/speak.py "$$TEXT_CONTENT" /tmp/tts-test.mp3 \
 	&& docker cp pipeline-chattts-worker:/tmp/tts-test.mp3 ./tts-test.mp3 \
 	&& echo "Saved → tts-test.mp3 ($$(du -h tts-test.mp3 | cut -f1))" \
 	|| echo "ERROR: pipeline-chattts-worker container not running (start with COMPOSE_PROFILES=chattts-tts)"
 
-# ── Inject test PDF ──────────────────────────────────────────────────────────
+# ── Inject book (auto-purges any existing run for the same filename) ──────────
 inject:
 	@test -n "$(FILE)" || (echo "Usage: make inject FILE=path/to/book.pdf"; exit 1)
-	cp "$(FILE)" ./inbox/
+	@FILENAME=$$(basename "$(FILE)"); \
+	EXISTING_ID=$$(docker exec pipeline-redis redis-cli eval \
+	  "local ids=redis.call('smembers','pipeline:seen_files'); for _,id in ipairs(ids) do if redis.call('hget','book:'..id,'filename')==ARGV[1] then return id end end; return ''" \
+	  0 "$$FILENAME"); \
+	if [ -n "$$EXISTING_ID" ]; then \
+	  echo "Found existing run for $$FILENAME ($$EXISTING_ID) — purging..."; \
+	  docker exec pipeline-redis redis-cli eval \
+	    "local items=redis.call('lrange',KEYS[1],0,-1); local r=0; for _,v in ipairs(items) do if string.find(v,ARGV[1],1,true) then redis.call('lrem',KEYS[1],1,v); r=r+1 end end; return r" \
+	    1 pipeline:tts "$$EXISTING_ID" > /dev/null; \
+	  docker exec pipeline-redis redis-cli eval \
+	    "local keys=redis.call('keys','chunk:'..ARGV[1]..':*'); for _,k in ipairs(keys) do redis.call('del',k) end; return #keys" \
+	    0 "$$EXISTING_ID" > /dev/null; \
+	  docker exec pipeline-redis redis-cli srem pipeline:seen_files "$$EXISTING_ID" > /dev/null; \
+	  docker exec pipeline-redis redis-cli del "book:$$EXISTING_ID" > /dev/null; \
+	  echo "Purged $$EXISTING_ID."; \
+	fi; \
+	cp "$(FILE)" ./inbox/; \
+	echo "Injected $$FILENAME → inbox/"
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 reset:

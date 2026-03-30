@@ -88,6 +88,7 @@ services:
       - CHATTTS_TOP_K=${CHATTTS_TOP_K:-20}
       - CHATTTS_SPEAKER_SEED=${CHATTTS_SPEAKER_SEED:-42}
       - CHATTTS_MAX_CHARS=${CHATTTS_MAX_CHARS:-300}
+      - CHATTTS_EMOTION=${CHATTTS_EMOTION:-narrator}
       - CHATTTS_REF_DIR=/ref
       - TZ=${TZ:-Africa/Nairobi}
     volumes:
