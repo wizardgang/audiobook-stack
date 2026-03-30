@@ -12,10 +12,12 @@ ChatTTS repo: https://github.com/2noise/ChatTTS
 
 import io
 import os
+import re
 import json
 import time
 import shutil
 import logging
+import unicodedata
 import threading
 import redis
 import numpy as np
@@ -221,6 +223,52 @@ def spool_flush_loop():
 
 # ── Text segmentation ─────────────────────────────────────────────────────────
 
+def _normalize_text(text: str) -> str:
+    """
+    Normalize Unicode book text to the ASCII-like character set ChatTTS accepts.
+
+    ChatTTS warns about and silently drops characters outside its whitelist,
+    which causes mispronunciations (e.g. apostrophes lost → "dont", em-dash
+    collapsing sentence structure). This function converts the most common
+    EPUB/PDF typography to plain equivalents before synthesis.
+    """
+    # Smart / curly quotes → straight ASCII
+    text = text.replace('\u201c', '"').replace('\u201d', '"')   # " "
+    text = text.replace('\u2018', "'").replace('\u2019', "'")   # ' '
+    text = text.replace('\u201a', ',').replace('\u201b', "'")   # ‚ ‛
+    text = text.replace('\u00ab', '"').replace('\u00bb', '"')   # « »
+
+    # Dashes → hyphen-space so sentence rhythm is preserved
+    text = text.replace('\u2014', ' - ')   # em-dash —
+    text = text.replace('\u2013', ' - ')   # en-dash –
+    text = text.replace('\u2012', ' - ')   # figure dash ‒
+    text = text.replace('\u2015', ' - ')   # horizontal bar ―
+
+    # Ellipsis
+    text = text.replace('\u2026', '...')   # …
+
+    # Other common typographic characters
+    text = text.replace('\u00b7', '.')     # middle dot ·
+    text = text.replace('\u2022', '.')     # bullet •
+    text = text.replace('\u00a0', ' ')     # non-breaking space
+
+    # Collapse newlines within a segment to a single space so they don't
+    # appear as invalid characters — the caller already split on sentences.
+    text = re.sub(r'\n+', ' ', text)
+
+    # Decompose accented characters to base + combining mark, then strip
+    # the combining marks — keeps the base letter (e → e, é → e).
+    text = ''.join(
+        c for c in unicodedata.normalize('NFD', text)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+    # Collapse runs of whitespace left by replacements
+    text = re.sub(r'  +', ' ', text).strip()
+
+    return text
+
+
 def _split_text(text: str, max_chars: int) -> list[str]:
     """
     Split text into segments of at most max_chars, breaking on sentence
@@ -267,6 +315,7 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
     import ChatTTS
 
     chat, spk_emb = get_engine()
+    text      = _normalize_text(text)
     segments  = _split_text(text, CHATTTS_MAX_CHARS)
     speed_int = _job_speed_to_token(speed_multiplier)
 
