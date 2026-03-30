@@ -1,9 +1,9 @@
-"""F5-TTS Worker service
+﻿"""F5-TTS Worker service
 - Runs on each node (local or remote)
 - Pulls chunk jobs from pipeline:tts
 - Synthesizes audio directly using F5-TTS (zero-shot voice cloning)
 - Writes MP3 to shared OUTPUT_DIR; spools locally if OUTPUT_DIR is offline
-- Background thread flushes spool → OUTPUT_DIR when the mount recovers
+- Background thread flushes spool -> OUTPUT_DIR when the mount recovers
 - Exports Prometheus metrics on port 8000
 """
 
@@ -22,13 +22,27 @@ from pathlib import Path
 from pydub import AudioSegment
 from prometheus_client import start_http_server, Counter, Histogram, Gauge
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(worker_id)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
 WORKER_ID = os.environ.get("WORKER_ID", "f5-local-1")
+
+
+class _WorkerIdFilter(logging.Filter):
+    """Inject worker_id into third-party log records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "worker_id"):
+            record.worker_id = "-"
+        return True
+
+
+_handler = logging.StreamHandler()
+_handler.addFilter(_WorkerIdFilter())
+_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s [f5-worker] %(levelname)s [%(worker_id)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+logging.root.setLevel(logging.INFO)
+logging.root.addHandler(_handler)
+
 
 log = logging.LoggerAdapter(
     logging.getLogger(__name__),
@@ -44,16 +58,19 @@ SMB_RETRY_INTERVAL = int(os.environ.get("SMB_RETRY_INTERVAL", "30"))
 F5_MODEL       = os.environ.get("F5_MODEL",       "F5TTS_v1_Base")
 F5_REF_AUDIO   = os.environ.get("F5_REF_AUDIO",   "/ref/reference.wav")
 F5_REF_TEXT    = os.environ.get("F5_REF_TEXT",    "")
-F5_SPEED       = float(os.environ.get("F5_SPEED", "1.0"))
+F5_SPEED       = float(os.environ.get("F5_SPEED", "0.9"))
+F5_MIN_SPEED   = float(os.environ.get("F5_MIN_SPEED", "0.6"))
+F5_MAX_SPEED   = float(os.environ.get("F5_MAX_SPEED", "1.3"))
 F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
 
-# Max chars per synthesis call — F5-TTS degrades on very long inputs
+# Max chars per synthesis call - F5-TTS degrades on very long inputs
 F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "1000"))
+F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
 
 QUEUE_TTS    = "pipeline:tts"
 QUEUE_DONE   = "pipeline:done"
 
-# ── Prometheus Metrics ───────────────────────────────────────────────────────
+#  Prometheus Metrics 
 JOBS_PROCESSED  = Counter('f5_worker_jobs_total', 'Total chunks processed', ['worker_id', 'status'])
 TTS_LATENCY     = Histogram('f5_worker_tts_latency_seconds', 'F5-TTS synthesis latency per segment', ['worker_id'])
 REDIS_RECONNECTS = Counter('f5_worker_redis_reconnects_total', 'Redis reconnection count', ['worker_id'])
@@ -70,7 +87,7 @@ SPOOL_FLUSHED   = Counter('f5_worker_spool_flushed_total', 'MP3 files flushed fr
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# ── F5-TTS engine (lazy-loaded on first use) ──────────────────────────────────
+#  F5-TTS engine (lazy-loaded on first use) 
 _tts_engine = None
 _tts_lock   = threading.Lock()
 
@@ -90,7 +107,7 @@ def get_tts_engine():
     return _tts_engine
 
 
-# ── SMB / Output-dir availability probe ──────────────────────────────────────
+#  SMB / Output-dir availability probe 
 
 def _output_available() -> bool:
     try:
@@ -118,10 +135,10 @@ def save_mp3(book_id: str, chunk_idx: int, mp3_bytes: bytes) -> str:
             with dest.open("wb") as f:
                 f.write(mp3_bytes)
             OUTPUT_WRITE_SECS.labels(worker_id=WORKER_ID, dest="output").observe(time.monotonic() - t0)
-            log.info("  Wrote MP3 → output (%d bytes)", len(mp3_bytes))
+            log.info("  Wrote MP3 -> output (%d bytes)", len(mp3_bytes))
             return str(dest)
         except OSError as exc:
-            log.warning("OUTPUT_DIR write failed (%s) — falling back to spool", exc)
+            log.warning("OUTPUT_DIR write failed (%s) - falling back to spool", exc)
 
     spool_path = SPOOL_DIR / rel
     spool_path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +165,7 @@ def spool_flush_loop():
             SPOOL_FILES.labels(worker_id=WORKER_ID).set(len(spooled))
             continue
 
-        log.info("Spool flush: OUTPUT_DIR back online — flushing %d file(s)", len(spooled))
+        log.info("Spool flush: OUTPUT_DIR back online - flushing %d file(s)", len(spooled))
         flushed = 0
         for src in spooled:
             rel  = src.relative_to(SPOOL_DIR)
@@ -161,7 +178,7 @@ def spool_flush_loop():
                 flushed += 1
                 SPOOL_FLUSHED.labels(worker_id=WORKER_ID).inc()
             except OSError as exc:
-                log.warning("Spool flush failed for %s: %s — will retry", src.name, exc)
+                log.warning("Spool flush failed for %s: %s - will retry", src.name, exc)
                 break
 
         remaining = len(spooled) - flushed
@@ -170,7 +187,7 @@ def spool_flush_loop():
             log.info("Spool flush: moved %d file(s) to output (%d remaining)", flushed, remaining)
 
 
-# ── Text segmentation ─────────────────────────────────────────────────────────
+#  Text segmentation 
 
 def _split_text(text: str, max_chars: int) -> list[str]:
     """
@@ -192,7 +209,7 @@ def _split_text(text: str, max_chars: int) -> list[str]:
             if pos > boundary:
                 boundary = pos
         if boundary <= 0:
-            # No sentence boundary — hard-cut at max_chars
+            # No sentence boundary - hard-cut at max_chars
             boundary = max_chars - 1
         segments.append(text[:boundary + 1].strip())
         text = text[boundary + 1:].strip()
@@ -200,16 +217,60 @@ def _split_text(text: str, max_chars: int) -> list[str]:
     return [s for s in segments if s]
 
 
-# ── F5-TTS progress stub ─────────────────────────────────────────────────────
+#  F5-TTS progress stub 
 class _NoopProgress:
-    """Minimal stand-in for gr.Progress() — satisfies F5-TTS's progress.tqdm() calls."""
+    """Minimal stand-in for gr.Progress() - satisfies F5-TTS's progress.tqdm() calls."""
     def __call__(self, *args, **kwargs): pass
     def tqdm(self, iterable, *args, **kwargs): return iterable
 
+class _LogProgress:
+    """Log incremental inference progress without noisy tqdm bars."""
 
-# ── F5-TTS synthesis ──────────────────────────────────────────────────────────
+    def __init__(self, label: str):
+        self.label = label
+        self._last_pct = -1
 
-def synthesize_text(text: str) -> tuple[bytes, float]:
+    def __call__(self, *args, **kwargs):
+        if not args:
+            return
+        value = args[0]
+        if not isinstance(value, (int, float)):
+            return
+        pct = int(value * 100) if value <= 1 else int(value)
+        pct = max(0, min(100, pct))
+        if pct == 100 or (pct - self._last_pct) >= F5_PROGRESS_LOG_STEP:
+            self._last_pct = pct
+            log.info("    %s progress: %d%%", self.label, pct)
+
+    def tqdm(self, iterable, *args, **kwargs):
+        total = kwargs.get("total")
+        if total is None:
+            try:
+                total = len(iterable)
+            except Exception:
+                total = None
+
+        if total and total > 0:
+            last_bucket = -1
+            for idx, item in enumerate(iterable, start=1):
+                pct = int((idx * 100) / total)
+                bucket = pct // F5_PROGRESS_LOG_STEP
+                if bucket > last_bucket or idx == total:
+                    last_bucket = bucket
+                    log.info("    %s progress: %d%%", self.label, pct)
+                yield item
+            return
+
+        for idx, item in enumerate(iterable, start=1):
+            if idx == 1 or idx % F5_PROGRESS_LOG_STEP == 0:
+                log.info("    %s step: %d", self.label, idx)
+            yield item
+
+
+
+#  F5-TTS synthesis 
+
+def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, float]:
     """
     Synthesize text using F5-TTS and return (mp3_bytes, audio_duration_seconds).
     Long texts are split into segments and concatenated.
@@ -226,13 +287,17 @@ def synthesize_text(text: str) -> tuple[bytes, float]:
     engine   = get_tts_engine()
     segments = _split_text(text, F5_MAX_CHARS)
     word_count = len(text.split())
-    log.info("  Text: %d chars, %d words → %d segment(s)", len(text), word_count, len(segments))
+    effective_speed = max(F5_MIN_SPEED, min(F5_MAX_SPEED, F5_SPEED * speed_multiplier))
+    log.info("  Effective speed: %.2f", effective_speed)
+    log.info("  Text: %d chars, %d words -> %d segment(s)", len(text), word_count, len(segments))
 
     audio_parts: list[np.ndarray] = []
     sample_rate = 24000  # F5-TTS default
 
     for i, seg in enumerate(segments):
         seg_words = len(seg.split())
+        seg_pct = int(((i + 1) * 100) / len(segments))
+        log.info("  Segment %d/%d (%d%%) starting ...", i + 1, len(segments), seg_pct)
         t_seg = time.monotonic()
         with TTS_LATENCY.labels(worker_id=WORKER_ID).time():
             with contextlib.redirect_stdout(io.StringIO()):
@@ -240,14 +305,14 @@ def synthesize_text(text: str) -> tuple[bytes, float]:
                     ref_file=ref_audio,
                     ref_text=ref_text,
                     gen_text=seg,
-                    speed=F5_SPEED,
+                    speed=effective_speed,
                     show_info=lambda *args, **kwargs: None,
-                    progress=_NoopProgress(),
+                    progress=_LogProgress(f"seg {i + 1}/{len(segments)}"),
                 )
         seg_dur   = len(wav) / sr
         seg_elapsed = time.monotonic() - t_seg
         rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0
-        log.info("  Seg %d/%d: %d words → %.1fs audio  (%.1fs wall, RTF %.2f)",
+        log.info("  Seg %d/%d: %d words -> %.1fs audio  (%.1fs wall, RTF %.2f)",
                  i + 1, len(segments), seg_words, seg_dur, seg_elapsed, rtf)
         sample_rate = sr
         audio_parts.append(wav)
@@ -255,7 +320,7 @@ def synthesize_text(text: str) -> tuple[bytes, float]:
     combined  = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
     total_dur = len(combined) / sample_rate
 
-    # Convert numpy float32 WAV → MP3 bytes via pydub
+    # Convert numpy float32 WAV -> MP3 bytes via pydub
     buf = io.BytesIO()
     sf.write(buf, combined, sample_rate, format="WAV", subtype="PCM_16")
     buf.seek(0)
@@ -265,7 +330,7 @@ def synthesize_text(text: str) -> tuple[bytes, float]:
     return mp3_buf.getvalue(), total_dur
 
 
-# ── Redis helpers ─────────────────────────────────────────────────────────────
+#  Redis helpers 
 
 def set_chunk_state(book_id: str, chunk_idx: int, **kwargs):
     r.hset(f"chunk:{book_id}:{chunk_idx}", mapping={k: str(v) for k, v in kwargs.items()})
@@ -278,7 +343,7 @@ def increment_done(book_id: str) -> tuple[int, int]:
     return done, total
 
 
-# ── Job processor ─────────────────────────────────────────────────────────────
+#  Job processor 
 
 def process_job(raw: str):
     job       = json.loads(raw)
@@ -292,7 +357,9 @@ def process_job(raw: str):
     JOB_START_TIME.labels(worker_id=WORKER_ID).set(start_time)
 
     text = job.get("text")
-    log.info("┌ [%d/%d] %s  (book %s)", chunk_idx + 1, total, title[:60], book_id[:8])
+    speed = float(job.get("speed", 1.0))
+    chunk_missing = False
+    log.info("|> [%d/%d] %s  (book %s)", chunk_idx + 1, total, title[:60], book_id[:8])
 
     set_chunk_state(book_id, chunk_idx,
         status="processing",
@@ -309,15 +376,30 @@ def process_job(raw: str):
             WORKER_LOGS.labels(worker_id=WORKER_ID, level="error").inc()
             log.error("Chunk file missing: %s", chunk_file)
             set_chunk_state(book_id, chunk_idx, status="error", error="chunk file missing")
-            increment_done(book_id)
-            return
+            chunk_missing = True
+
+    if chunk_missing:
+        done, total_chunks = increment_done(book_id)
+        pct = (done / total_chunks * 100.0) if total_chunks else 0.0
+        log.info("  Progress: %d/%d chunks complete (%.1f%%)", done, total_chunks, pct)
+        if done == total_chunks:
+            book_title = r.hget(f"book:{book_id}", "title") or title
+            r.lpush(QUEUE_DONE, json.dumps({
+                "book_id": book_id,
+                "title":   book_title,
+                "total":   total_chunks,
+                "out_dir": str(OUTPUT_DIR / book_id),
+            }))
+            r.hset(f"book:{book_id}", "status", "merging")
+            log.info("  All chunks done - merge triggered for '%s'", book_title)
+        return
 
     try:
-        mp3_bytes, audio_dur = synthesize_text(text)
+        mp3_bytes, audio_dur = synthesize_text(text, speed_multiplier=speed)
         dest_path = save_mp3(book_id, chunk_idx, mp3_bytes)
 
         elapsed = time.time() - start_time
-        log.info("└ chunk %d done  %.1fs audio  %d KB  %.1fs wall",
+        log.info("<| chunk %d done  %.1fs audio  %d KB  %.1fs wall",
                  chunk_idx, audio_dur, len(mp3_bytes) // 1024, elapsed)
 
         set_chunk_state(book_id, chunk_idx,
@@ -334,12 +416,13 @@ def process_job(raw: str):
     except Exception as exc:
         JOBS_PROCESSED.labels(worker_id=WORKER_ID, status="failed").inc()
         WORKER_LOGS.labels(worker_id=WORKER_ID, level="error").inc()
-        log.error("└ chunk %d FAILED: %s", chunk_idx, exc)
+        log.error("<| chunk %d FAILED: %s", chunk_idx, exc)
         set_chunk_state(book_id, chunk_idx, status="error", error=str(exc))
-        # Continue — always increment so Merger can finalize remaining chunks.
+        # Continue - always increment so Merger can finalize remaining chunks.
 
     done, total_chunks = increment_done(book_id)
-    log.info("  Progress: %d/%d chunks complete", done, total_chunks)
+    pct = (done / total_chunks * 100.0) if total_chunks else 0.0
+    log.info("  Progress: %d/%d chunks complete (%.1f%%)", done, total_chunks, pct)
 
     if done == total_chunks:
         book_title = r.hget(f"book:{book_id}", "title") or title
@@ -350,10 +433,10 @@ def process_job(raw: str):
             "out_dir": str(OUTPUT_DIR / book_id),
         }))
         r.hset(f"book:{book_id}", "status", "merging")
-        log.info("  All chunks done — merge triggered for '%s'", book_title)
+        log.info("  All chunks done - merge triggered for '%s'", book_title)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+#  Main loop 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -372,8 +455,17 @@ def main():
     log.info("Starting Prometheus metrics server on port %d", prom_port)
     start_http_server(prom_port)
 
-    log.info("F5-TTS Worker %s ready — consuming %s", WORKER_ID, QUEUE_TTS)
-    log.info("Model: %s | Device: %s | Ref audio: %s", F5_MODEL, F5_DEVICE, F5_REF_AUDIO)
+    log.info("F5-TTS Worker %s ready - consuming %s", WORKER_ID, QUEUE_TTS)
+    log.info(
+        "Model: %s | Device: %s | Ref audio: %s | Base speed: %.2f (min %.2f / max %.2f) | Progress step: %d%%",
+        F5_MODEL,
+        F5_DEVICE,
+        F5_REF_AUDIO,
+        F5_SPEED,
+        F5_MIN_SPEED,
+        F5_MAX_SPEED,
+        F5_PROGRESS_LOG_STEP,
+    )
     log.info("Output dir: %s | Spool dir: %s | Flush interval: %ds",
              OUTPUT_DIR, SPOOL_DIR, SMB_RETRY_INTERVAL)
 
@@ -403,7 +495,7 @@ def main():
         except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
             WORKER_STATUS.labels(worker_id=WORKER_ID).set(2)
             WORKER_LOGS.labels(worker_id=WORKER_ID, level="warning").inc()
-            log.warning("Lost connection to Redis — retrying in 5s (%s)", exc.__class__.__name__)
+            log.warning("Lost connection to Redis - retrying in 5s (%s)", exc.__class__.__name__)
             REDIS_RECONNECTS.labels(worker_id=WORKER_ID).inc()
             time.sleep(5)
         except Exception as exc:
@@ -415,3 +507,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

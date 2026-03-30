@@ -9,6 +9,8 @@ Requirements:
 
 Set `F5_REF_TEXT` in your `.env` to the text spoken in the reference audio.
 This text is used by F5-TTS to align the reference voice for zero-shot cloning.
+If `F5_REF_TEXT` does not match exactly, narration can sound unnaturally fast
+or unstable.
 
 Example `.env`:
 ```
