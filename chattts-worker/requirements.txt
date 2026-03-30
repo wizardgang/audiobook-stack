@@ -1,3 +1,7 @@
+# Pin transformers BEFORE installing ChatTTS so pip doesn't pull in 5.x,
+# which removed the public encode_plus from BertTokenizer (ChatTTS #987).
+transformers==4.46.3
+
 # Install ChatTTS directly from the official GitHub repo
 git+https://github.com/2noise/ChatTTS.git
 
