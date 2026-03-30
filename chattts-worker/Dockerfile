@@ -21,7 +21,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Layer 2: source ────────────────────────────────────────────────────────────
-COPY worker.py .
+COPY worker.py speak.py ./
 
 RUN mkdir -p /data/outputs /outputs /spool /ref /models
 

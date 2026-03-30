@@ -4,7 +4,7 @@ EXCLUDES = --exclude=inbox --exclude=outputs --exclude=audiobooks --exclude=.git
 USER ?= root
 DEST ?= /root/tts-node
 
-.PHONY: up down logs status reset worker-remote inject sync watch-sync retry books invalidate-chunks purge-book
+.PHONY: up down logs status reset worker-remote inject sync watch-sync retry books invalidate-chunks purge-book speak speak-chattts
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 
@@ -49,6 +49,36 @@ worker-remote:
 	  WORKER_ID=$(WORKER_ID) \
 	  docker compose -f docker-compose.worker.yml up -d --build"
 	@echo "Remote worker $(WORKER_ID) started on $(USER)@$(HOST):$(DEST)"
+
+# ── Audio quality test ───────────────────────────────────────────────────────
+# Synthesise text directly, bypassing the full pipeline. Output: ./tts-test.mp3
+#
+# Abogen/Kokoro (abogen container must be running):
+#   make speak TEXT="The quick brown fox jumps over the lazy dog."
+#   make speak FILE=test.txt
+#
+# ChatTTS (pipeline-chattts-worker container must be running):
+#   make speak-chattts TEXT="The quick brown fox."
+#   make speak-chattts FILE=test.txt
+
+speak:
+	@test -n "$(TEXT)$(FILE)" || (echo "Usage: make speak TEXT='...'  or  make speak FILE=path/to/file.txt"; exit 1)
+	@TEXT_CONTENT=$$([ -n "$(FILE)" ] && cat "$(FILE)" || printf '%s' "$(TEXT)"); \
+	PAYLOAD=$$(python3 -c "import json,sys; print(json.dumps({'text':sys.argv[1],'format':'mp3'}))" "$$TEXT_CONTENT"); \
+	curl -sf -X POST http://localhost:8808/api/generate \
+		-H "Content-Type: application/json" \
+		-d "$$PAYLOAD" \
+		-o tts-test.mp3 \
+	&& echo "Saved → tts-test.mp3 ($$(du -h tts-test.mp3 | cut -f1))" \
+	|| echo "ERROR: abogen API call failed — is the abogen container running?"
+
+speak-chattts:
+	@test -n "$(TEXT)$(FILE)" || (echo "Usage: make speak-chattts TEXT='...'  or  make speak-chattts FILE=path/to/file.txt"; exit 1)
+	@TEXT_CONTENT=$$([ -n "$(FILE)" ] && cat "$(FILE)" || printf '%s' "$(TEXT)"); \
+	docker exec pipeline-chattts-worker python /app/speak.py "$$TEXT_CONTENT" /tmp/tts-test.mp3 \
+	&& docker cp pipeline-chattts-worker:/tmp/tts-test.mp3 ./tts-test.mp3 \
+	&& echo "Saved → tts-test.mp3 ($$(du -h tts-test.mp3 | cut -f1))" \
+	|| echo "ERROR: pipeline-chattts-worker container not running (start with COMPOSE_PROFILES=chattts-tts)"
 
 # ── Inject test PDF ──────────────────────────────────────────────────────────
 inject:
