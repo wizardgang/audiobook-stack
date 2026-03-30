@@ -1,7 +1,10 @@
-ChatTTS
-redis
-prometheus-client
+# Install ChatTTS directly from the official GitHub repo
+git+https://github.com/2noise/ChatTTS.git
+
+# Audio conversion
 soundfile
 pydub
-numpy
-torch
+
+# Pipeline
+redis
+prometheus-client

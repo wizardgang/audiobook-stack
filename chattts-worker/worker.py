@@ -3,7 +3,11 @@
 - Synthesizes audio directly using ChatTTS (local inference, no HTTP call)
 - Writes MP3 to shared OUTPUT_DIR; spools locally if OUTPUT_DIR is offline
 - Background thread flushes spool → OUTPUT_DIR when the mount recovers
+- Speaker embedding is persisted in CHATTTS_REF_DIR so the voice stays
+  consistent across container restarts without re-seeding
 - Exports Prometheus metrics on port 8004 (default)
+
+ChatTTS repo: https://github.com/2noise/ChatTTS
 """
 
 import io
@@ -38,50 +42,82 @@ OUTPUT_DIR         = Path(os.environ.get("OUTPUT_DIR",    "/data/outputs"))
 SPOOL_DIR          = Path(os.environ.get("SPOOL_DIR",     "/spool"))
 SMB_RETRY_INTERVAL = int(os.environ.get("SMB_RETRY_INTERVAL", "30"))
 
+# Directory for persisted speaker embedding (speaker.pt written on first run)
+CHATTTS_REF_DIR    = Path(os.environ.get("CHATTTS_REF_DIR", "/ref"))
+
 # ChatTTS configuration
-# Speed: integer 1–9 where 5 is normal pace. Maps to the job's float speed multiplier.
+# Speed: integer 1–9 injected as [speed_N] token — 5 is normal pace.
+# The per-chunk speed multiplier from the orchestrator scales this base value.
 CHATTTS_SPEED       = int(os.environ.get("CHATTTS_SPEED",       "5"))
 CHATTTS_TEMPERATURE = float(os.environ.get("CHATTTS_TEMPERATURE", "0.3"))
 CHATTTS_TOP_P       = float(os.environ.get("CHATTTS_TOP_P",      "0.7"))
 CHATTTS_TOP_K       = int(os.environ.get("CHATTTS_TOP_K",        "20"))
-# Integer seed for reproducible speaker embedding (same voice across all chunks).
+# Integer seed used when generating the speaker embedding for the first time.
+# Change to get a different consistent voice; delete ref/speaker.pt to regenerate.
 CHATTTS_SPEAKER_SEED = int(os.environ.get("CHATTTS_SPEAKER_SEED", "42"))
-# Max chars per synthesis segment — quality degrades on very long inputs.
+# Max chars per synthesis call — quality degrades on very long inputs.
 CHATTTS_MAX_CHARS   = int(os.environ.get("CHATTTS_MAX_CHARS",   "300"))
 CHATTTS_DEVICE      = os.environ.get(
     "CHATTTS_DEVICE",
     "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu",
 )
 
-# ChatTTS sample rate is always 24 kHz
+# ChatTTS outputs 24 kHz PCM float32
 CHATTTS_SAMPLE_RATE = 24000
 
 QUEUE_TTS  = "pipeline:tts"
 QUEUE_DONE = "pipeline:done"
 
 # ── Prometheus Metrics ────────────────────────────────────────────────────────
-JOBS_PROCESSED   = Counter("chattts_worker_jobs_total", "Total chunks processed", ["worker_id", "status"])
-TTS_LATENCY      = Histogram("chattts_worker_tts_latency_seconds", "ChatTTS synthesis latency per segment", ["worker_id"])
-REDIS_RECONNECTS = Counter("chattts_worker_redis_reconnects_total", "Redis reconnection count", ["worker_id"])
-WORKER_HEARTBEAT = Gauge("chattts_worker_heartbeat_timestamp", "Last activity timestamp", ["worker_id"])
-WORKER_STATUS    = Gauge("chattts_worker_status", "Worker state (0=Idle, 1=Processing, 2=Error)", ["worker_id"])
-WORKER_LOGS      = Counter("chattts_worker_logs_total", "Warning/error log count", ["worker_id", "level"])
-JOB_START_TIME   = Gauge("chattts_worker_job_start_timestamp_seconds", "Chunk start timestamp", ["worker_id"])
+JOBS_PROCESSED    = Counter("chattts_worker_jobs_total", "Total chunks processed", ["worker_id", "status"])
+TTS_LATENCY       = Histogram("chattts_worker_tts_latency_seconds", "ChatTTS synthesis latency per segment", ["worker_id"])
+REDIS_RECONNECTS  = Counter("chattts_worker_redis_reconnects_total", "Redis reconnection count", ["worker_id"])
+WORKER_HEARTBEAT  = Gauge("chattts_worker_heartbeat_timestamp", "Last activity timestamp", ["worker_id"])
+WORKER_STATUS     = Gauge("chattts_worker_status", "Worker state (0=Idle, 1=Processing, 2=Error)", ["worker_id"])
+WORKER_LOGS       = Counter("chattts_worker_logs_total", "Warning/error log count", ["worker_id", "level"])
+JOB_START_TIME    = Gauge("chattts_worker_job_start_timestamp_seconds", "Chunk start timestamp", ["worker_id"])
 JOB_COMPLETION_TIME = Gauge("chattts_worker_job_completion_timestamp_seconds", "Chunk completion timestamp", ["worker_id"])
-JOB_DURATION     = Histogram("chattts_worker_job_processing_duration_seconds", "End-to-end chunk processing time", ["worker_id"])
+JOB_DURATION      = Histogram("chattts_worker_job_processing_duration_seconds", "End-to-end chunk processing time", ["worker_id"])
 OUTPUT_WRITE_SECS = Histogram(
     "chattts_worker_output_write_seconds", "Time to write MP3 to destination",
     ["worker_id", "dest"], buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30],
 )
-SPOOL_FILES  = Gauge("chattts_worker_spool_files", "MP3 files waiting in local spool", ["worker_id"])
+SPOOL_FILES   = Gauge("chattts_worker_spool_files", "MP3 files waiting in local spool", ["worker_id"])
 SPOOL_FLUSHED = Counter("chattts_worker_spool_flushed_total", "MP3 files flushed from spool to OUTPUT_DIR", ["worker_id"])
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# ── ChatTTS engine (lazy-loaded on first use) ─────────────────────────────────
-_chat       = None
-_spk_emb    = None
+# ── ChatTTS engine (lazy-loaded, thread-safe) ─────────────────────────────────
+_chat        = None
+_spk_emb     = None
 _engine_lock = threading.Lock()
+
+
+def _load_or_create_speaker(chat) -> str:
+    """
+    Return a speaker embedding string.
+
+    • If ref/speaker.pt exists on disk, load and return it — voice is stable
+      across container restarts with no reliance on RNG state.
+    • Otherwise, generate one from CHATTTS_SPEAKER_SEED, save it to
+      ref/speaker.pt, and return it.
+    """
+    import torch
+
+    speaker_path = CHATTTS_REF_DIR / "speaker.pt"
+
+    if speaker_path.exists():
+        spk_emb = torch.load(str(speaker_path), map_location="cpu", weights_only=True)
+        log.info("Loaded speaker embedding from %s", speaker_path)
+        return spk_emb
+
+    log.info("Generating speaker embedding (seed=%d) ...", CHATTTS_SPEAKER_SEED)
+    CHATTTS_REF_DIR.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(CHATTTS_SPEAKER_SEED)
+    spk_emb = chat.sample_random_speaker()
+    torch.save(spk_emb, str(speaker_path))
+    log.info("Speaker embedding saved to %s", speaker_path)
+    return spk_emb
 
 
 def get_engine():
@@ -92,19 +128,19 @@ def get_engine():
     with _engine_lock:
         if _chat is not None:
             return _chat, _spk_emb
+        import torch
+
         log.info("Loading ChatTTS model on device '%s' ...", CHATTTS_DEVICE)
         import ChatTTS
         chat = ChatTTS.Chat()
-        chat.load(device=CHATTTS_DEVICE, compile=False)
-
-        # Fix a speaker embedding so every chunk in the book sounds the same.
-        # torch.manual_seed makes sample_random_speaker deterministic.
-        import torch
-        torch.manual_seed(CHATTTS_SPEAKER_SEED)
-        spk_emb = chat.sample_random_speaker()
-
+        chat.load(
+            source="huggingface",
+            device=torch.device(CHATTTS_DEVICE),
+            compile=False,
+        )
+        spk_emb = _load_or_create_speaker(chat)
         _chat, _spk_emb = chat, spk_emb
-        log.info("ChatTTS model loaded (speaker seed=%d).", CHATTTS_SPEAKER_SEED)
+        log.info("ChatTTS model ready.")
     return _chat, _spk_emb
 
 
@@ -211,10 +247,11 @@ def _split_text(text: str, max_chars: int) -> list[str]:
     return [s for s in segments if s]
 
 
-def _speed_to_chattts(speed_multiplier: float) -> int:
+def _job_speed_to_token(speed_multiplier: float) -> int:
     """
-    Map a job speed float (0.5–2.0, 1.0=normal) to ChatTTS speed int (1–9, 5=normal).
-    The base speed is CHATTTS_SPEED (env var); the job multiplier scales it.
+    Map a job speed float (0.5–2.0, 1.0=normal) to a ChatTTS speed integer
+    (1–9, 5=normal) for use in the [speed_N] prompt token.
+    Scales around the configured base CHATTTS_SPEED.
     """
     scaled = CHATTTS_SPEED * speed_multiplier
     return max(1, min(9, round(scaled)))
@@ -230,20 +267,22 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
     import ChatTTS
 
     chat, spk_emb = get_engine()
-    segments = _split_text(text, CHATTTS_MAX_CHARS)
-    chattts_speed = _speed_to_chattts(speed_multiplier)
+    segments  = _split_text(text, CHATTTS_MAX_CHARS)
+    speed_int = _job_speed_to_token(speed_multiplier)
 
     log.info(
-        "  Text: %d chars → %d segment(s), speed=%d",
-        len(text), len(segments), chattts_speed,
+        "  Text: %d chars → %d segment(s)  [speed_%d]",
+        len(text), len(segments), speed_int,
     )
 
+    # Speed is injected via the [speed_N] prompt token inside InferCodeParams.
+    # RefineTextParams controls prosody naturalness via oral/break/laugh tokens.
     params_infer = ChatTTS.Chat.InferCodeParams(
         spk_emb=spk_emb,
+        prompt=f"[speed_{speed_int}]",
         temperature=CHATTTS_TEMPERATURE,
         top_P=CHATTTS_TOP_P,
         top_K=CHATTTS_TOP_K,
-        speed=chattts_speed,
     )
     params_refine = ChatTTS.Chat.RefineTextParams(
         prompt="[oral_2][laugh_0][break_4]",
@@ -259,9 +298,8 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
                 params_refine_text=params_refine,
                 params_infer_code=params_infer,
             )
-        wav = wavs[0]
-        if wav.ndim > 1:
-            wav = wav[0]
+        # wavs[0] is a 1-D float32 numpy array at CHATTTS_SAMPLE_RATE Hz
+        wav = np.array(wavs[0], dtype=np.float32)
         seg_dur     = len(wav) / CHATTTS_SAMPLE_RATE
         seg_elapsed = time.monotonic() - t_seg
         rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0.0
@@ -274,7 +312,7 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
     combined  = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
     total_dur = len(combined) / CHATTTS_SAMPLE_RATE
 
-    # float32 numpy → WAV → MP3
+    # float32 PCM → WAV (in-memory) → MP3 via pydub
     buf = io.BytesIO()
     sf.write(buf, combined, CHATTTS_SAMPLE_RATE, format="WAV", subtype="PCM_16")
     buf.seek(0)
@@ -354,7 +392,7 @@ def process_job(raw: str):
         WORKER_LOGS.labels(worker_id=WORKER_ID, level="error").inc()
         log.error("└ chunk %d FAILED: %s", chunk_idx, exc)
         set_chunk_state(book_id, chunk_idx, status="error", error=str(exc))
-        # Always continue — increment so Merger can finalize remaining chunks.
+        # Always increment so the Merger can finalize remaining chunks.
 
     done, total_chunks = increment_done(book_id)
     log.info("  Progress: %d/%d chunks complete", done, total_chunks)
@@ -376,8 +414,9 @@ def process_job(raw: str):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    CHATTTS_REF_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Warm up model before first job to avoid cold-start latency.
+    # Warm up the model before the first job to avoid cold-start latency.
     try:
         get_engine()
     except Exception as exc:
@@ -391,9 +430,9 @@ def main():
     start_http_server(prom_port)
 
     log.info("ChatTTS Worker %s ready — consuming %s", WORKER_ID, QUEUE_TTS)
-    log.info("Device: %s | Speed: %d | Temp: %.2f | Speaker seed: %d | Max chars: %d",
+    log.info("Device: %s | Base speed: %d | Temp: %.2f | Speaker seed: %d | Ref dir: %s",
              CHATTTS_DEVICE, CHATTTS_SPEED, CHATTTS_TEMPERATURE,
-             CHATTTS_SPEAKER_SEED, CHATTTS_MAX_CHARS)
+             CHATTTS_SPEAKER_SEED, CHATTTS_REF_DIR)
     log.info("Output dir: %s | Spool dir: %s | Flush interval: %ds",
              OUTPUT_DIR, SPOOL_DIR, SMB_RETRY_INTERVAL)
 

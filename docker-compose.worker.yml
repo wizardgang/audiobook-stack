@@ -88,11 +88,15 @@ services:
       - CHATTTS_TOP_K=${CHATTTS_TOP_K:-20}
       - CHATTTS_SPEAKER_SEED=${CHATTTS_SPEAKER_SEED:-42}
       - CHATTTS_MAX_CHARS=${CHATTTS_MAX_CHARS:-300}
+      - CHATTTS_REF_DIR=/ref
       - TZ=${TZ:-Africa/Nairobi}
     volumes:
       - ${OUTPUT_DIR:-./outputs}:/outputs
       - chattts-spool:/spool
       - chattts-models:/models
+      # Bind-mount so speaker.pt is visible on the host and survives rebuilds.
+      # Delete ref/speaker.pt to regenerate the voice with the current seed.
+      - ./chattts-worker/ref:/ref
 
 volumes:
   worker-spool:
