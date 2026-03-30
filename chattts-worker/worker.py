@@ -26,13 +26,32 @@ from pathlib import Path
 from pydub import AudioSegment
 from prometheus_client import start_http_server, Counter, Histogram, Gauge
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [chattts] %(levelname)s [%(worker_id)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
 WORKER_ID = os.environ.get("WORKER_ID", "chattts-local-1")
+
+
+class _WorkerIdFilter(logging.Filter):
+    """
+    Inject worker_id into every log record that doesn't already have one.
+
+    Our own log calls go through a LoggerAdapter that sets worker_id = WORKER_ID.
+    Third-party loggers (e.g. ChatTTS internals) propagate to the root handler
+    but carry no worker_id extra, causing a ValueError when the formatter tries
+    to substitute %(worker_id)s. This filter provides a safe fallback.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "worker_id"):
+            record.worker_id = "-"
+        return True
+
+
+_handler = logging.StreamHandler()
+_handler.addFilter(_WorkerIdFilter())
+_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s [chattts] %(levelname)s [%(worker_id)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+logging.root.setLevel(logging.INFO)
+logging.root.addHandler(_handler)
 
 log = logging.LoggerAdapter(
     logging.getLogger(__name__),
