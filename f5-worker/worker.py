@@ -63,12 +63,15 @@ F5_MIN_SPEED   = float(os.environ.get("F5_MIN_SPEED", "0.6"))
 F5_MAX_SPEED   = float(os.environ.get("F5_MAX_SPEED", "1.3"))
 F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
 
-# Max chars per synthesis call - F5-TTS degrades on very long inputs
-F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "1000"))
+# Max chars per synthesis call - F5-TTS degrades on very long inputs.
+# Keep this low enough that ref_mel + gen_mel stays within the model's
+# positional-encoding budget (rule of thumb: ≤400 chars per segment).
+F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "400"))
 F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
-# Recovery for rare F5 tensor-size mismatch failures on specific long segments.
-F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "180"))
-F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "3"))
+# Recovery for tensor-size mismatch failures (typically: reference audio too long).
+# MIN_CHARS is the floor for sub-segment size; MAX_DEPTH is how many times to halve.
+F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "60"))
+F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "4"))
 
 QUEUE_TTS    = "pipeline:tts"
 QUEUE_DONE   = "pipeline:done"
@@ -300,7 +303,7 @@ def _infer_segment_with_fallback(
         can_retry_split = (
             is_tensor_mismatch
             and depth < F5_RETRY_SPLIT_MAX_DEPTH
-            and len(seg_text) >= (F5_RETRY_SPLIT_MIN_CHARS * 2)
+            and len(seg_text) > F5_RETRY_SPLIT_MIN_CHARS
         )
         if not can_retry_split:
             raise
