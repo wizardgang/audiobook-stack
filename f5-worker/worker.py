@@ -66,6 +66,9 @@ F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_
 # Max chars per synthesis call - F5-TTS degrades on very long inputs
 F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "1000"))
 F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
+# Recovery for rare F5 tensor-size mismatch failures on specific long segments.
+F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "180"))
+F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "3"))
 
 QUEUE_TTS    = "pipeline:tts"
 QUEUE_DONE   = "pipeline:done"
@@ -267,6 +270,79 @@ class _LogProgress:
             yield item
 
 
+def _infer_segment_with_fallback(
+    engine,
+    ref_audio: str,
+    ref_text: str,
+    seg_text: str,
+    speed: float,
+    label: str,
+    depth: int = 0,
+) -> tuple[np.ndarray, int]:
+    """
+    Run one F5 infer call, and if it hits the known tensor-size mismatch error,
+    recursively split the text into smaller parts and retry.
+    """
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            wav, sr, _ = engine.infer(
+                ref_file=ref_audio,
+                ref_text=ref_text,
+                gen_text=seg_text,
+                speed=speed,
+                show_info=lambda *args, **kwargs: None,
+                progress=_LogProgress(label),
+            )
+        return wav, sr
+    except Exception as exc:
+        msg = str(exc)
+        is_tensor_mismatch = "Sizes of tensors must match" in msg
+        can_retry_split = (
+            is_tensor_mismatch
+            and depth < F5_RETRY_SPLIT_MAX_DEPTH
+            and len(seg_text) >= (F5_RETRY_SPLIT_MIN_CHARS * 2)
+        )
+        if not can_retry_split:
+            raise
+
+        next_max = max(F5_RETRY_SPLIT_MIN_CHARS, len(seg_text) // 2)
+        sub_segments = _split_text(seg_text, next_max)
+        if len(sub_segments) <= 1:
+            raise
+
+        log.warning(
+            "    %s tensor mismatch at depth %d; retrying as %d sub-segments (max_chars=%d)",
+            label,
+            depth,
+            len(sub_segments),
+            next_max,
+        )
+
+        parts: list[np.ndarray] = []
+        out_sr = None
+        for j, sub in enumerate(sub_segments, start=1):
+            child_label = f"{label}.{j}/{len(sub_segments)}"
+            child_wav, child_sr = _infer_segment_with_fallback(
+                engine=engine,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                seg_text=sub,
+                speed=speed,
+                label=child_label,
+                depth=depth + 1,
+            )
+            if out_sr is None:
+                out_sr = child_sr
+            elif child_sr != out_sr:
+                raise RuntimeError(
+                    f"Sample rate mismatch while recovering segment: {out_sr} vs {child_sr}"
+                )
+            parts.append(child_wav)
+
+        merged = np.concatenate(parts) if len(parts) > 1 else parts[0]
+        return merged, out_sr
+
+
 
 #  F5-TTS synthesis 
 
@@ -300,15 +376,14 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
         log.info("  Segment %d/%d (%d%%) starting ...", i + 1, len(segments), seg_pct)
         t_seg = time.monotonic()
         with TTS_LATENCY.labels(worker_id=WORKER_ID).time():
-            with contextlib.redirect_stdout(io.StringIO()):
-                wav, sr, _ = engine.infer(
-                    ref_file=ref_audio,
-                    ref_text=ref_text,
-                    gen_text=seg,
-                    speed=effective_speed,
-                    show_info=lambda *args, **kwargs: None,
-                    progress=_LogProgress(f"seg {i + 1}/{len(segments)}"),
-                )
+            wav, sr = _infer_segment_with_fallback(
+                engine=engine,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                seg_text=seg,
+                speed=effective_speed,
+                label=f"seg {i + 1}/{len(segments)}",
+            )
         seg_dur   = len(wav) / sr
         seg_elapsed = time.monotonic() - t_seg
         rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0
