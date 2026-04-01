@@ -289,8 +289,22 @@ def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str, book_id: str = None
     """
     if not F5_ROLLING_CTX_ENABLED:
         return
+
+    # Sanity check: if the segment is mostly silence, don't use it as context
+    # (prevents hallucinations from propagating)
+    rms = np.sqrt(np.mean(wav**2))
+    if rms < 0.005:  # Very quiet/silent
+        log.info("  Rolling context skipped (segment too quiet: rms=%.4f)", rms)
+        return
+
     ctx_samples = int(F5_ROLLING_CTX_SECS * sr)
     ctx_wav = wav[-ctx_samples:] if len(wav) > ctx_samples else wav
+
+    # One more sanity check: the last few seconds shouldn't be silent either
+    ctx_rms = np.sqrt(np.mean(ctx_wav**2))
+    if ctx_rms < 0.005:
+        log.info("  Rolling context skipped (tail too quiet: rms=%.4f)", ctx_rms)
+        return
 
     # Estimate the text portion spoken in the captured window
     ctx_ratio = len(ctx_wav) / max(1, len(wav))
@@ -456,12 +470,28 @@ def _infer_segment_with_fallback(
     except Exception as exc:
         msg = str(exc)
         is_tensor_mismatch = "Sizes of tensors must match" in msg
+
+        # New: if using rolling context, try falling back to base reference FIRST
+        # before splitting. A bad rolling context (hallucinations) is a common cause.
+        if is_tensor_mismatch and ref_audio != F5_REF_AUDIO:
+            log.warning("    %s tensor mismatch; retrying with base reference...", label)
+            return _infer_segment_with_fallback(
+                engine=engine,
+                ref_audio=F5_REF_AUDIO,
+                ref_text=F5_REF_TEXT,
+                seg_text=seg_text,
+                speed=speed,
+                label=label + " (base-ref-fallback)",
+                depth=depth,  # don't increase depth for ref swap
+            )
+
         can_retry_split = (
             is_tensor_mismatch
             and depth < F5_RETRY_SPLIT_MAX_DEPTH
             and len(seg_text) > F5_RETRY_SPLIT_MIN_CHARS
         )
         if not can_retry_split:
+            log.error("    %s FAILED at depth %d. Text length: %d. Msg: %s", label, depth, len(seg_text), msg)
             raise
 
         next_max = max(F5_RETRY_SPLIT_MIN_CHARS, len(seg_text) // 3)
@@ -500,7 +530,6 @@ def _infer_segment_with_fallback(
 
         merged = np.concatenate(parts) if len(parts) > 1 else parts[0]
         return merged, out_sr
-
 
 
 #  F5-TTS synthesis
@@ -543,7 +572,6 @@ def synthesize_text(
 ) -> tuple[bytes, float]:
     """
     Synthesize *text* using F5-TTS and return (mp3_bytes, audio_duration_seconds).
-    # ... (docstring unchanged)
     """
     if not Path(F5_REF_AUDIO).exists():
         raise FileNotFoundError(
@@ -593,9 +621,11 @@ def synthesize_text(
                     label=f"seg {i + 1}/{len(segments)}",
                 )
         except Exception as exc:
-            log.error("  Segment %d/%d failed: %s", i + 1, len(segments), exc)
+            log.error("  Segment %d/%d FAILED: %s", i + 1, len(segments), exc)
             log.error("  Segment text: %.100r", seg)
-        
+            log.error("  Ref audio: %s", ref_audio)
+            raise
+
         seg_dur     = len(wav) / sr
         seg_elapsed = time.monotonic() - t_seg
         rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0
@@ -859,7 +889,7 @@ def main():
     except Exception as exc:
         log.warning("pysbd init failed: %s", exc)
 
-    # Trim base reference to ≤ 12s to stay within positional encoding budget
+    # Trim base reference to ≤ 8s to stay within positional encoding budget
     _trim_base_reference()
 
     flush_thread = threading.Thread(target=spool_flush_loop, daemon=True, name="spool-flush")
