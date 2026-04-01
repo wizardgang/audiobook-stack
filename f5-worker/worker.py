@@ -582,15 +582,20 @@ def synthesize_text(
         seg_pct = int(((i + 1) * 100) / len(segments))
         log.info("  Segment %d/%d (%d%%) starting ...", i + 1, len(segments), seg_pct)
         t_seg = time.monotonic()
-        with TTS_LATENCY.labels(worker_id=WORKER_ID).time():
-            wav, sr = _infer_segment_with_fallback(
-                engine=engine,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                seg_text=seg,
-                speed=effective_speed,
-                label=f"seg {i + 1}/{len(segments)}",
-            )
+        try:
+            with TTS_LATENCY.labels(worker_id=WORKER_ID).time():
+                wav, sr = _infer_segment_with_fallback(
+                    engine=engine,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    seg_text=seg,
+                    speed=effective_speed,
+                    label=f"seg {i + 1}/{len(segments)}",
+                )
+        except Exception as exc:
+            log.error("  Segment %d/%d failed: %s", i + 1, len(segments), exc)
+            log.error("  Segment text: %.100r", seg)
+        
         seg_dur     = len(wav) / sr
         seg_elapsed = time.monotonic() - t_seg
         rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0
