@@ -76,8 +76,8 @@ F5_MAX_SPEED   = float(os.environ.get("F5_MAX_SPEED", "1.3"))
 F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
 
 # Max chars per synthesis call — keep ref_mel + gen_mel within the model's
-# positional-encoding budget (≤200 chars leaves plenty of headroom with an 8 s ref).
-F5_MAX_CHARS         = int(os.environ.get("F5_MAX_CHARS", "200"))
+# positional-encoding budget (≤150 chars leaves plenty of headroom with an 8 s ref).
+F5_MAX_CHARS         = int(os.environ.get("F5_MAX_CHARS", "150"))
 F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
 
 # Tensor-mismatch recovery: recursive segment splitting.
@@ -279,10 +279,10 @@ def _split_text(text: str, max_chars: int) -> list[str]:
 
 # Module-level state: updated after each synthesised segment.
 # chapter/heading chunks clear this so the next body chunk starts fresh.
-_rolling_ctx: dict[str, Any] = {"path": None, "text": ""}
+_rolling_ctx: dict[str, Any] = {"path": None, "text": "", "book_id": None}
 
 
-def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str) -> None:
+def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str, book_id: str = None) -> None:
     """
     Extract the last F5_ROLLING_CTX_SECS of *wav* and write it to a temp WAV.
     Estimate the corresponding spoken text by proportional char slice.
@@ -310,6 +310,7 @@ def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str) -> None:
         sf.write(tmp_path, ctx_wav, sr, subtype="PCM_16")
         _rolling_ctx["path"] = tmp_path
         _rolling_ctx["text"] = ctx_text
+        _rolling_ctx["book_id"] = book_id
         if old_path and old_path != tmp_path and os.path.exists(old_path):
             os.unlink(old_path)
     except OSError as exc:
@@ -326,6 +327,7 @@ def _clear_rolling_ctx() -> None:
             pass
     _rolling_ctx["path"] = None
     _rolling_ctx["text"] = ""
+    _rolling_ctx["book_id"] = None
 
 
 def _get_ref() -> tuple[str, str]:
@@ -503,28 +505,45 @@ def _infer_segment_with_fallback(
 
 #  F5-TTS synthesis
 
+def _trim_base_reference() -> None:
+    """
+    Check the duration of F5_REF_AUDIO and trim it to ≤ 12s if necessary.
+    Long references (e.g. 30s) cause 'Sizes of tensors must match' errors
+    because they leave no headroom in the model's positional-encoding budget.
+    """
+    global F5_REF_AUDIO
+    src = Path(F5_REF_AUDIO)
+    if not src.exists():
+        return
+
+    try:
+        seg = AudioSegment.from_file(str(src))
+        duration = len(seg) / 1000.0
+        if duration <= 12.0:
+            log.info("Base reference duration: %.2fs (OK)", duration)
+            return
+
+        log.info("Base reference is too long (%.2fs) - trimming to 8s for stability", duration)
+        trimmed = seg[:8000]
+        # Use a temp file for the trimmed reference
+        fd, tmp_path = tempfile.mkstemp(suffix="_ref_trimmed.wav", prefix="f5_base_")
+        os.close(fd)
+        trimmed.export(tmp_path, format="wav")
+        F5_REF_AUDIO = tmp_path
+        log.info("Trimmed base reference saved to: %s", tmp_path)
+    except Exception as exc:
+        log.warning("Failed to probe/trim base reference: %s", exc)
+
+
 def synthesize_text(
     text: str,
     speed_multiplier: float = 1.0,
     is_heading: bool = False,
+    book_id: str = None,
 ) -> tuple[bytes, float]:
     """
     Synthesize *text* using F5-TTS and return (mp3_bytes, audio_duration_seconds).
-
-    Segmentation:
-      - Long texts are split via pysbd (sentence boundaries) and concatenated.
-
-    Reference audio:
-      - is_heading=True  → always uses the fixed base reference (F5_REF_AUDIO).
-      - is_heading=False → uses the rolling-context ref if one exists, otherwise
-        falls back to the base reference.
-
-    Rolling context:
-      After each successfully synthesised segment the last F5_ROLLING_CTX_SECS
-      of generated audio is extracted and written to a temp WAV which becomes
-      the reference for the *next* segment (and the next chunk).  This keeps
-      the voice/prosody consistent throughout the book without drifting from
-      a stale base reference.
+    # ... (docstring unchanged)
     """
     if not Path(F5_REF_AUDIO).exists():
         raise FileNotFoundError(
@@ -582,7 +601,7 @@ def synthesize_text(
 
         # Update rolling context for the next segment (not for headings)
         if not is_heading:
-            _update_rolling_ctx(wav, sr, seg)
+            _update_rolling_ctx(wav, sr, seg, book_id=book_id)
             ref_audio, ref_text = _get_ref()
 
     combined  = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
@@ -667,8 +686,14 @@ def process_job(raw: str):
     if heading:
         log.info("  Detected chapter heading — using base ref + pause padding")
 
+    # Clear rolling context if this is the very first chunk of a book
+    # or if the book_id has changed since the last synthesized segment.
+    if chunk_idx == 0 or (F5_ROLLING_CTX_ENABLED and _rolling_ctx.get("book_id") != book_id):
+        _clear_rolling_ctx()
+        log.info("  Rolling context reset for book start / switch")
+
     try:
-        mp3_bytes, audio_dur = synthesize_text(text, speed_multiplier=speed, is_heading=heading)
+        mp3_bytes, audio_dur = synthesize_text(text, speed_multiplier=speed, is_heading=heading, book_id=book_id)
 
         if heading:
             # Add silence + crossfade padding around the heading audio
@@ -828,6 +853,9 @@ def main():
         _get_pysbd()
     except Exception as exc:
         log.warning("pysbd init failed: %s", exc)
+
+    # Trim base reference to ≤ 12s to stay within positional encoding budget
+    _trim_base_reference()
 
     flush_thread = threading.Thread(target=spool_flush_loop, daemon=True, name="spool-flush")
     flush_thread.start()
