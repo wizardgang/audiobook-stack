@@ -722,9 +722,98 @@ def process_job(raw: str):
         log.info("  All chunks done - merge triggered for '%s'", book_title)
 
 
+#  Standalone test mode (no Redis)
+
+def _run_test_chunk(text: str, out_path: str) -> None:
+    """
+    Synthesise *text* directly and write the result to *out_path*.
+    No Redis connection is required.  Heading detection, chapter padding,
+    and rolling-context logic all apply exactly as in production.
+
+    Usage:
+        python worker.py --test "Chapter 1" --out /tmp/heading.mp3
+        python worker.py --test-file chunk.txt --out /tmp/body.mp3
+    """
+    heading = _is_chapter_heading(text)
+
+    log.info("=== TEST MODE ===")
+    log.info("Text     : %d chars, %d words", len(text), len(text.split()))
+    log.info("Heading  : %s", heading)
+    log.info("Ref audio: %s", F5_REF_AUDIO)
+    log.info("Output   : %s", out_path)
+    log.info("=================")
+
+    t0 = time.time()
+    mp3_bytes, audio_dur = synthesize_text(text, is_heading=heading)
+
+    if heading:
+        mp3_bytes = _add_chapter_padding(mp3_bytes)
+        audio_dur += (F5_CHAPTER_PAUSE_PRE_MS + F5_CHAPTER_PAUSE_POST_MS) / 1000.0
+        log.info("Chapter padding applied.")
+
+    elapsed = time.time() - t0
+    rtf = elapsed / audio_dur if audio_dur > 0 else 0.0
+
+    dest = Path(out_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(mp3_bytes)
+
+    log.info("=== RESULT ===")
+    log.info("Audio    : %.2f s", audio_dur)
+    log.info("File     : %d KB", len(mp3_bytes) // 1024)
+    log.info("Wall     : %.1f s  (RTF %.2f)", elapsed, rtf)
+    log.info("Saved    : %s", out_path)
+    log.info("==============")
+
+
 #  Main loop
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="F5-TTS Worker — Redis pipeline mode or standalone test mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Test mode examples (no Redis required):\n"
+            '  python worker.py --test "Chapter 1: The Beginning" --out heading.mp3\n'
+            "  python worker.py --test-file body.txt --out body.mp3\n"
+        ),
+    )
+    parser.add_argument(
+        "--test",
+        metavar="TEXT",
+        help="Synthesise TEXT and exit without connecting to Redis.",
+    )
+    parser.add_argument(
+        "--test-file",
+        metavar="PATH",
+        help="Read plain-text from PATH, synthesise, and exit.",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="PATH",
+        default="test_output.mp3",
+        help="Output MP3 path for --test / --test-file (default: test_output.mp3).",
+    )
+    args = parser.parse_args()
+
+    # ── Test mode ──────────────────────────────────────────────────────────────
+    if args.test or args.test_file:
+        if args.test_file:
+            text = Path(args.test_file).read_text(encoding="utf-8").strip()
+        else:
+            text = args.test.strip()
+
+        if not text:
+            parser.error("Text is empty.")
+
+        get_tts_engine()
+        _get_pysbd()
+        _run_test_chunk(text, args.out)
+        return
+
+    # ── Redis pipeline mode ────────────────────────────────────────────────────
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
