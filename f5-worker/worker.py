@@ -507,9 +507,9 @@ def _infer_segment_with_fallback(
 
 def _trim_base_reference() -> None:
     """
-    Check the duration of F5_REF_AUDIO and trim it to ≤ 12s if necessary.
-    Long references (e.g. 30s) cause 'Sizes of tensors must match' errors
-    because they leave no headroom in the model's positional-encoding budget.
+    Check the duration of F5_REF_AUDIO and trim it to ≤ 8s if necessary.
+    Long references (e.g. >10s) consume too much of the model's positional-encoding
+    budget, causing 'Sizes of tensors must match' errors even on short segments.
     """
     global F5_REF_AUDIO
     src = Path(F5_REF_AUDIO)
@@ -519,7 +519,7 @@ def _trim_base_reference() -> None:
     try:
         seg = AudioSegment.from_file(str(src))
         duration = len(seg) / 1000.0
-        if duration <= 12.0:
+        if duration <= 8.5:
             log.info("Base reference duration: %.2fs (OK)", duration)
             return
 
