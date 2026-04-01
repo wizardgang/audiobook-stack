@@ -1,20 +1,32 @@
-﻿"""F5-TTS Worker service
+"""F5-TTS Worker service
 - Runs on each node (local or remote)
 - Pulls chunk jobs from pipeline:tts
 - Synthesizes audio directly using F5-TTS (zero-shot voice cloning)
 - Writes MP3 to shared OUTPUT_DIR; spools locally if OUTPUT_DIR is offline
 - Background thread flushes spool -> OUTPUT_DIR when the mount recovers
 - Exports Prometheus metrics on port 8000
+
+Key features:
+  - pysbd sentence-boundary segmentation for natural phrase splits
+  - Rolling-context reference: last ~3 s of generated audio becomes the
+    next segment's ref, maintaining consistent voice/prosody across the book
+  - Chapter/heading detection: resets to base ref + adds silence padding
+    and fade-in/out for a "title card" effect
+  - Tensor-mismatch fallback: splits failing segments recursively (//3)
+    until the model succeeds or the minimum size floor is hit
 """
 
 import io
 import os
+import re
 import contextlib
 import json
+import tempfile
 import time
 import shutil
 import logging
 import threading
+from typing import Any
 import redis
 import numpy as np
 import soundfile as sf
@@ -63,20 +75,30 @@ F5_MIN_SPEED   = float(os.environ.get("F5_MIN_SPEED", "0.6"))
 F5_MAX_SPEED   = float(os.environ.get("F5_MAX_SPEED", "1.3"))
 F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
 
-# Max chars per synthesis call - F5-TTS degrades on very long inputs.
-# Keep this low enough that ref_mel + gen_mel stays within the model's
-# positional-encoding budget (rule of thumb: ≤400 chars per segment).
-F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "400"))
+# Max chars per synthesis call — keep ref_mel + gen_mel within the model's
+# positional-encoding budget (≤200 chars leaves plenty of headroom with an 8 s ref).
+F5_MAX_CHARS         = int(os.environ.get("F5_MAX_CHARS", "200"))
 F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
-# Recovery for tensor-size mismatch failures (typically: reference audio too long).
-# MIN_CHARS is the floor for sub-segment size; MAX_DEPTH is how many times to split.
+
+# Tensor-mismatch recovery: recursive segment splitting.
+# MIN_CHARS = floor for sub-segment size; MAX_DEPTH = max recursion levels.
 F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "30"))
 F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "6"))
+
+# Rolling context: after each segment, use the last N seconds of generated
+# audio as the reference for the next segment to maintain voice consistency.
+F5_ROLLING_CTX_ENABLED = os.environ.get("F5_ROLLING_CTX", "true").lower() == "true"
+F5_ROLLING_CTX_SECS    = float(os.environ.get("F5_ROLLING_CTX_SECS", "3.0"))
+
+# Chapter / heading padding: silence + crossfade applied to detected headings.
+F5_CHAPTER_PAUSE_PRE_MS  = int(os.environ.get("F5_CHAPTER_PAUSE_PRE_MS",  "1500"))
+F5_CHAPTER_PAUSE_POST_MS = int(os.environ.get("F5_CHAPTER_PAUSE_POST_MS", "2500"))
+F5_CHAPTER_FADE_MS       = int(os.environ.get("F5_CHAPTER_FADE_MS",       "400"))
 
 QUEUE_TTS    = "pipeline:tts"
 QUEUE_DONE   = "pipeline:done"
 
-#  Prometheus Metrics 
+#  Prometheus Metrics
 JOBS_PROCESSED  = Counter('f5_worker_jobs_total', 'Total chunks processed', ['worker_id', 'status'])
 TTS_LATENCY     = Histogram('f5_worker_tts_latency_seconds', 'F5-TTS synthesis latency per segment', ['worker_id'])
 REDIS_RECONNECTS = Counter('f5_worker_redis_reconnects_total', 'Redis reconnection count', ['worker_id'])
@@ -93,7 +115,7 @@ SPOOL_FLUSHED   = Counter('f5_worker_spool_flushed_total', 'MP3 files flushed fr
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-#  F5-TTS engine (lazy-loaded on first use) 
+#  F5-TTS engine (lazy-loaded on first use)
 _tts_engine = None
 _tts_lock   = threading.Lock()
 
@@ -113,7 +135,24 @@ def get_tts_engine():
     return _tts_engine
 
 
-#  SMB / Output-dir availability probe 
+#  pysbd sentence segmenter (lazy-loaded)
+_pysbd_seg  = None
+_pysbd_lock = threading.Lock()
+
+
+def _get_pysbd():
+    global _pysbd_seg
+    if _pysbd_seg is not None:
+        return _pysbd_seg
+    with _pysbd_lock:
+        if _pysbd_seg is None:
+            import pysbd
+            _pysbd_seg = pysbd.Segmenter(language="en", clean=True)
+            log.info("pysbd segmenter initialised.")
+    return _pysbd_seg
+
+
+#  SMB / Output-dir availability probe
 
 def _output_available() -> bool:
     try:
@@ -193,37 +232,152 @@ def spool_flush_loop():
             log.info("Spool flush: moved %d file(s) to output (%d remaining)", flushed, remaining)
 
 
-#  Text segmentation 
+#  Text segmentation (pysbd)
 
 def _split_text(text: str, max_chars: int) -> list[str]:
     """
-    Split text into segments of at most max_chars characters, breaking on
-    sentence boundaries (period, exclamation, question mark) where possible.
+    Split *text* into segments of at most *max_chars* characters using pysbd
+    sentence-boundary detection.  Falls back to word-boundary hard-cut only
+    when a single sentence itself exceeds *max_chars*.
     """
     if len(text) <= max_chars:
         return [text]
 
-    segments = []
-    while text:
-        if len(text) <= max_chars:
-            segments.append(text)
-            break
-        # Find a good break point within the limit
-        boundary = -1
-        for punct in ('.', '!', '?', '\n'):
-            pos = text.rfind(punct, 0, max_chars)
-            if pos > boundary:
-                boundary = pos
-        if boundary <= 0:
-            # No sentence boundary - hard-cut at max_chars
-            boundary = max_chars - 1
-        segments.append(text[:boundary + 1].strip())
-        text = text[boundary + 1:].strip()
+    sentences = _get_pysbd().segment(text)
+    chunks: list[str] = []
+    current = ""
 
-    return [s for s in segments if s]
+    for sentence in sentences:
+        candidate = (current + " " + sentence).strip() if current else sentence
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            if len(sentence) > max_chars:
+                # Single sentence too long — word-boundary hard split
+                words = sentence.split()
+                current = ""
+                for word in words:
+                    trial = (current + " " + word).strip() if current else word
+                    if len(trial) <= max_chars:
+                        current = trial
+                    else:
+                        if current:
+                            chunks.append(current)
+                        current = word
+            else:
+                current = sentence
+
+    if current:
+        chunks.append(current)
+
+    return [c for c in chunks if c]
 
 
-#  F5-TTS progress stub 
+#  Rolling context reference
+
+# Module-level state: updated after each synthesised segment.
+# chapter/heading chunks clear this so the next body chunk starts fresh.
+_rolling_ctx: dict[str, Any] = {"path": None, "text": ""}
+
+
+def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str) -> None:
+    """
+    Extract the last F5_ROLLING_CTX_SECS of *wav* and write it to a temp WAV.
+    Estimate the corresponding spoken text by proportional char slice.
+    """
+    if not F5_ROLLING_CTX_ENABLED:
+        return
+    ctx_samples = int(F5_ROLLING_CTX_SECS * sr)
+    ctx_wav = wav[-ctx_samples:] if len(wav) > ctx_samples else wav
+
+    # Estimate the text portion spoken in the captured window
+    ctx_ratio = len(ctx_wav) / max(1, len(wav))
+    ctx_chars = max(20, int(len(text) * ctx_ratio))
+    ctx_text = text[-ctx_chars:].strip()
+    # Start at a word boundary so the ref text begins cleanly
+    sp = ctx_text.find(" ")
+    if 0 < sp < len(ctx_text) - 5:
+        ctx_text = ctx_text[sp:].strip()
+    if not ctx_text:
+        ctx_text = text[-30:].strip()
+
+    old_path = _rolling_ctx.get("path")
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix="_ctx.wav", prefix="f5_")
+        os.close(fd)
+        sf.write(tmp_path, ctx_wav, sr, subtype="PCM_16")
+        _rolling_ctx["path"] = tmp_path
+        _rolling_ctx["text"] = ctx_text
+        if old_path and old_path != tmp_path and os.path.exists(old_path):
+            os.unlink(old_path)
+    except OSError as exc:
+        log.warning("Rolling ctx write failed: %s", exc)
+
+
+def _clear_rolling_ctx() -> None:
+    """Delete the rolling-context temp file and reset state."""
+    path = _rolling_ctx.get("path")
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _rolling_ctx["path"] = None
+    _rolling_ctx["text"] = ""
+
+
+def _get_ref() -> tuple[str, str]:
+    """Return (ref_audio_path, ref_text) from rolling ctx if valid, else base."""
+    path = _rolling_ctx.get("path")
+    text = _rolling_ctx.get("text", "")
+    if F5_ROLLING_CTX_ENABLED and path and os.path.exists(path) and text:
+        return path, text
+    return F5_REF_AUDIO, F5_REF_TEXT
+
+
+#  Chapter / heading detection and padding
+
+_HEADING_RE = re.compile(
+    r"^\s*(chapter|prologue|epilogue|part\b|book\b|section|interlude|"
+    r"introduction|foreword|preface|afterword|appendix|notes?\b|"
+    r"acknowledgements?|dedication)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_chapter_heading(text: str) -> bool:
+    """
+    Return True when the chunk looks like a chapter/section heading:
+    short (≤200 chars) and starts with a known heading keyword.
+    """
+    stripped = text.strip()
+    return len(stripped) <= 200 and bool(_HEADING_RE.match(stripped))
+
+
+def _add_chapter_padding(mp3_bytes: bytes) -> bytes:
+    """
+    Wrap a heading MP3 with:
+      - F5_CHAPTER_PAUSE_PRE_MS  ms of leading silence
+      - fade-in of F5_CHAPTER_FADE_MS ms
+      - fade-out of F5_CHAPTER_FADE_MS ms
+      - F5_CHAPTER_PAUSE_POST_MS ms of trailing silence
+
+    The fade-in / fade-out creates a smooth crossfade point at both
+    boundaries when the audiobook player concatenates adjacent chunks.
+    """
+    seg = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
+    seg = seg.fade_in(F5_CHAPTER_FADE_MS).fade_out(F5_CHAPTER_FADE_MS)
+    silence_pre  = AudioSegment.silent(duration=F5_CHAPTER_PAUSE_PRE_MS,  frame_rate=seg.frame_rate)
+    silence_post = AudioSegment.silent(duration=F5_CHAPTER_PAUSE_POST_MS, frame_rate=seg.frame_rate)
+    padded = silence_pre + seg + silence_post
+    buf = io.BytesIO()
+    padded.export(buf, format="mp3", bitrate="128k")
+    return buf.getvalue()
+
+
+#  F5-TTS progress stub
 class _NoopProgress:
     """Minimal stand-in for gr.Progress() - satisfies F5-TTS's progress.tqdm() calls."""
     def __call__(self, *args, **kwargs): pass
@@ -284,7 +438,7 @@ def _infer_segment_with_fallback(
 ) -> tuple[np.ndarray, int]:
     """
     Run one F5 infer call, and if it hits the known tensor-size mismatch error,
-    recursively split the text into smaller parts and retry.
+    recursively split the text into smaller parts (//3 each level) and retry.
     """
     try:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -347,19 +501,34 @@ def _infer_segment_with_fallback(
 
 
 
-#  F5-TTS synthesis 
+#  F5-TTS synthesis
 
-def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, float]:
+def synthesize_text(
+    text: str,
+    speed_multiplier: float = 1.0,
+    is_heading: bool = False,
+) -> tuple[bytes, float]:
     """
-    Synthesize text using F5-TTS and return (mp3_bytes, audio_duration_seconds).
-    Long texts are split into segments and concatenated.
-    """
-    ref_audio = F5_REF_AUDIO
-    ref_text  = F5_REF_TEXT
+    Synthesize *text* using F5-TTS and return (mp3_bytes, audio_duration_seconds).
 
-    if not Path(ref_audio).exists():
+    Segmentation:
+      - Long texts are split via pysbd (sentence boundaries) and concatenated.
+
+    Reference audio:
+      - is_heading=True  → always uses the fixed base reference (F5_REF_AUDIO).
+      - is_heading=False → uses the rolling-context ref if one exists, otherwise
+        falls back to the base reference.
+
+    Rolling context:
+      After each successfully synthesised segment the last F5_ROLLING_CTX_SECS
+      of generated audio is extracted and written to a temp WAV which becomes
+      the reference for the *next* segment (and the next chunk).  This keeps
+      the voice/prosody consistent throughout the book without drifting from
+      a stale base reference.
+    """
+    if not Path(F5_REF_AUDIO).exists():
         raise FileNotFoundError(
-            f"Reference audio not found: {ref_audio}. "
+            f"Base reference audio not found: {F5_REF_AUDIO}. "
             "Set F5_REF_AUDIO env var to a valid .wav file path."
         )
 
@@ -367,8 +536,24 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
     segments = _split_text(text, F5_MAX_CHARS)
     word_count = len(text.split())
     effective_speed = max(F5_MIN_SPEED, min(F5_MAX_SPEED, F5_SPEED * speed_multiplier))
-    log.info("  Effective speed: %.2f", effective_speed)
+    log.info("  Effective speed: %.2f  |  heading: %s", effective_speed, is_heading)
     log.info("  Text: %d chars, %d words -> %d segment(s)", len(text), word_count, len(segments))
+
+    # Headings always use the fixed base reference so that rolling context
+    # (which may reflect the cadence of preceding body text) is not carried
+    # into the distinct heading voice.
+    if is_heading:
+        ref_audio, ref_text = F5_REF_AUDIO, F5_REF_TEXT
+        log.info("  ref: base (heading)")
+    else:
+        ref_audio, ref_text = _get_ref()
+        src = "rolling-ctx" if ref_audio != F5_REF_AUDIO else "base-ref"
+        log.info("  ref: %s (%d chars)", src, len(ref_text))
+
+    # Sanity-check: rolling ctx file might have been deleted by OS cleanup
+    if ref_audio != F5_REF_AUDIO and not Path(ref_audio).exists():
+        log.warning("  Rolling ctx file gone, falling back to base ref")
+        ref_audio, ref_text = F5_REF_AUDIO, F5_REF_TEXT
 
     audio_parts: list[np.ndarray] = []
     sample_rate = 24000  # F5-TTS default
@@ -387,13 +572,18 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
                 speed=effective_speed,
                 label=f"seg {i + 1}/{len(segments)}",
             )
-        seg_dur   = len(wav) / sr
+        seg_dur     = len(wav) / sr
         seg_elapsed = time.monotonic() - t_seg
         rtf = seg_elapsed / seg_dur if seg_dur > 0 else 0
         log.info("  Seg %d/%d: %d words -> %.1fs audio  (%.1fs wall, RTF %.2f)",
                  i + 1, len(segments), seg_words, seg_dur, seg_elapsed, rtf)
         sample_rate = sr
         audio_parts.append(wav)
+
+        # Update rolling context for the next segment (not for headings)
+        if not is_heading:
+            _update_rolling_ctx(wav, sr, seg)
+            ref_audio, ref_text = _get_ref()
 
     combined  = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
     total_dur = len(combined) / sample_rate
@@ -408,7 +598,7 @@ def synthesize_text(text: str, speed_multiplier: float = 1.0) -> tuple[bytes, fl
     return mp3_buf.getvalue(), total_dur
 
 
-#  Redis helpers 
+#  Redis helpers
 
 def set_chunk_state(book_id: str, chunk_idx: int, **kwargs):
     r.hset(f"chunk:{book_id}:{chunk_idx}", mapping={k: str(v) for k, v in kwargs.items()})
@@ -421,7 +611,7 @@ def increment_done(book_id: str) -> tuple[int, int]:
     return done, total
 
 
-#  Job processor 
+#  Job processor
 
 def process_job(raw: str):
     job       = json.loads(raw)
@@ -472,8 +662,26 @@ def process_job(raw: str):
             log.info("  All chunks done - merge triggered for '%s'", book_title)
         return
 
+    # Detect chapter / section headings
+    heading = _is_chapter_heading(text)
+    if heading:
+        log.info("  Detected chapter heading — using base ref + pause padding")
+
     try:
-        mp3_bytes, audio_dur = synthesize_text(text, speed_multiplier=speed)
+        mp3_bytes, audio_dur = synthesize_text(text, speed_multiplier=speed, is_heading=heading)
+
+        if heading:
+            # Add silence + crossfade padding around the heading audio
+            mp3_bytes = _add_chapter_padding(mp3_bytes)
+            audio_dur += (F5_CHAPTER_PAUSE_PRE_MS + F5_CHAPTER_PAUSE_POST_MS) / 1000.0
+            log.info(
+                "  Chapter padding applied (pre=%dms, post=%dms, fade=%dms)",
+                F5_CHAPTER_PAUSE_PRE_MS, F5_CHAPTER_PAUSE_POST_MS, F5_CHAPTER_FADE_MS,
+            )
+            # Reset rolling context so the next body chunk starts fresh from base ref
+            _clear_rolling_ctx()
+            log.info("  Rolling context cleared after heading")
+
         dest_path = save_mp3(book_id, chunk_idx, mp3_bytes)
 
         elapsed = time.time() - start_time
@@ -514,7 +722,7 @@ def process_job(raw: str):
         log.info("  All chunks done - merge triggered for '%s'", book_title)
 
 
-#  Main loop 
+#  Main loop
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -525,6 +733,12 @@ def main():
         get_tts_engine()
     except Exception as exc:
         log.warning("F5-TTS model pre-load failed (will retry on first job): %s", exc)
+
+    # Warm up pysbd so the first chunk doesn't pay import time
+    try:
+        _get_pysbd()
+    except Exception as exc:
+        log.warning("pysbd init failed: %s", exc)
 
     flush_thread = threading.Thread(target=spool_flush_loop, daemon=True, name="spool-flush")
     flush_thread.start()
@@ -543,6 +757,14 @@ def main():
         F5_MIN_SPEED,
         F5_MAX_SPEED,
         F5_PROGRESS_LOG_STEP,
+    )
+    log.info(
+        "Rolling ctx: %s (%.1fs window) | Chapter pause: pre=%dms post=%dms fade=%dms",
+        "enabled" if F5_ROLLING_CTX_ENABLED else "disabled",
+        F5_ROLLING_CTX_SECS,
+        F5_CHAPTER_PAUSE_PRE_MS,
+        F5_CHAPTER_PAUSE_POST_MS,
+        F5_CHAPTER_FADE_MS,
     )
     log.info("Output dir: %s | Spool dir: %s | Flush interval: %ds",
              OUTPUT_DIR, SPOOL_DIR, SMB_RETRY_INTERVAL)
@@ -585,4 +807,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

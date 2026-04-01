@@ -2,4 +2,5 @@ redis
 prometheus-client
 soundfile
 pydub
+pysbd
 f5-tts
