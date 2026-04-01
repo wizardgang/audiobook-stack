@@ -69,9 +69,9 @@ F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_
 F5_MAX_CHARS   = int(os.environ.get("F5_MAX_CHARS", "400"))
 F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
 # Recovery for tensor-size mismatch failures (typically: reference audio too long).
-# MIN_CHARS is the floor for sub-segment size; MAX_DEPTH is how many times to halve.
-F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "60"))
-F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "4"))
+# MIN_CHARS is the floor for sub-segment size; MAX_DEPTH is how many times to split.
+F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "30"))
+F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "6"))
 
 QUEUE_TTS    = "pipeline:tts"
 QUEUE_DONE   = "pipeline:done"
@@ -308,7 +308,7 @@ def _infer_segment_with_fallback(
         if not can_retry_split:
             raise
 
-        next_max = max(F5_RETRY_SPLIT_MIN_CHARS, len(seg_text) // 2)
+        next_max = max(F5_RETRY_SPLIT_MIN_CHARS, len(seg_text) // 3)
         sub_segments = _split_text(seg_text, next_max)
         if len(sub_segments) <= 1:
             raise
