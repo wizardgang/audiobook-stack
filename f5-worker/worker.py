@@ -89,6 +89,7 @@ F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "8"))
 # audio as the reference for the next segment to maintain voice consistency.
 F5_ROLLING_CTX_ENABLED = os.environ.get("F5_ROLLING_CTX", "true").lower() == "true"
 F5_ROLLING_CTX_SECS    = float(os.environ.get("F5_ROLLING_CTX_SECS", "2.0"))
+F5_ROLLING_CTX_MIN_DUR = float(os.environ.get("F5_ROLLING_CTX_MIN_DUR", "1.0"))
 
 # Chapter / heading padding: silence + crossfade applied to detected headings.
 F5_CHAPTER_PAUSE_PRE_MS  = int(os.environ.get("F5_CHAPTER_PAUSE_PRE_MS",  "1500"))
@@ -314,6 +315,14 @@ def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str, book_id: str = None
     ctx_rms = np.sqrt(np.mean(ctx_wav**2))
     if ctx_rms < 0.005:
         log.info("  Rolling context skipped (tail too quiet: rms=%.4f)", ctx_rms)
+        return
+
+    # Check minimum duration: short segments (e.g. single words) make poor
+    # references and often cause the model to repeat or 'echo' the reference
+    # into the next segment. We only update if the segment is long enough.
+    dur = len(wav) / sr
+    if dur < F5_ROLLING_CTX_MIN_DUR:
+        log.info("  Rolling context update skipped (segment too short: %.2fs < %.2fs)", dur, F5_ROLLING_CTX_MIN_DUR)
         return
 
     # Estimate the text portion spoken in the captured window
