@@ -76,19 +76,19 @@ F5_MAX_SPEED   = float(os.environ.get("F5_MAX_SPEED", "1.3"))
 F5_DEVICE      = os.environ.get("F5_DEVICE",      "cuda" if os.environ.get("USE_GPU", "false").lower() == "true" else "cpu")
 
 # Max chars per synthesis call — keep ref_mel + gen_mel within the model's
-# positional-encoding budget (≤150 chars leaves plenty of headroom with an 8 s ref).
-F5_MAX_CHARS         = int(os.environ.get("F5_MAX_CHARS", "150"))
+# positional-encoding budget (≤80 chars is the 'sweet spot' for stability).
+F5_MAX_CHARS         = int(os.environ.get("F5_MAX_CHARS", "80"))
 F5_PROGRESS_LOG_STEP = max(1, int(os.environ.get("F5_PROGRESS_LOG_STEP", "10")))
 
 # Tensor-mismatch recovery: recursive segment splitting.
 # MIN_CHARS = floor for sub-segment size; MAX_DEPTH = max recursion levels.
-F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "30"))
-F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "6"))
+F5_RETRY_SPLIT_MIN_CHARS = int(os.environ.get("F5_RETRY_SPLIT_MIN_CHARS", "10"))
+F5_RETRY_SPLIT_MAX_DEPTH = int(os.environ.get("F5_RETRY_SPLIT_MAX_DEPTH", "8"))
 
 # Rolling context: after each segment, use the last N seconds of generated
 # audio as the reference for the next segment to maintain voice consistency.
 F5_ROLLING_CTX_ENABLED = os.environ.get("F5_ROLLING_CTX", "true").lower() == "true"
-F5_ROLLING_CTX_SECS    = float(os.environ.get("F5_ROLLING_CTX_SECS", "3.0"))
+F5_ROLLING_CTX_SECS    = float(os.environ.get("F5_ROLLING_CTX_SECS", "2.0"))
 
 # Chapter / heading padding: silence + crossfade applied to detected headings.
 F5_CHAPTER_PAUSE_PRE_MS  = int(os.environ.get("F5_CHAPTER_PAUSE_PRE_MS",  "1500"))
@@ -297,6 +297,16 @@ def _update_rolling_ctx(wav: np.ndarray, sr: int, text: str, book_id: str = None
         log.info("  Rolling context skipped (segment too quiet: rms=%.4f)", rms)
         return
 
+    # Trim trailing silence from the generated wav before capturing context.
+    # This prevents 'dead air' at the end of the reference which often causes
+    # the model to stutter or repeat words at the start of the next segment.
+    non_silent_idx = np.where(np.abs(wav) > 0.005)[0]
+    if len(non_silent_idx) > 0:
+        last_idx = non_silent_idx[-1]
+        # Keep a tiny bit of buffer (30ms) to avoid clipping words
+        buffer = int(0.03 * sr)
+        wav = wav[:min(len(wav), last_idx + buffer)]
+
     ctx_samples = int(F5_ROLLING_CTX_SECS * sr)
     ctx_wav = wav[-ctx_samples:] if len(wav) > ctx_samples else wav
 
@@ -471,8 +481,7 @@ def _infer_segment_with_fallback(
         msg = str(exc)
         is_tensor_mismatch = "Sizes of tensors must match" in msg
 
-        # New: if using rolling context, try falling back to base reference FIRST
-        # before splitting. A bad rolling context (hallucinations) is a common cause.
+        # 1) Try falling back to base reference FIRST (if using rolling context)
         if is_tensor_mismatch and ref_audio != F5_REF_AUDIO:
             log.warning("    %s tensor mismatch; retrying with base reference...", label)
             return _infer_segment_with_fallback(
@@ -482,9 +491,24 @@ def _infer_segment_with_fallback(
                 seg_text=seg_text,
                 speed=speed,
                 label=label + " (base-ref-fallback)",
-                depth=depth,  # don't increase depth for ref swap
+                depth=depth,
             )
 
+        # 2) Try cleaning text (removing problematic trailing punctuation/spaces)
+        cleaned = seg_text.strip().strip(";:,.-—\"'").strip()
+        if is_tensor_mismatch and cleaned != seg_text.strip() and len(cleaned) > 0:
+            log.warning("    %s tensor mismatch; retrying with cleaned text...", label)
+            return _infer_segment_with_fallback(
+                engine=engine,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                seg_text=cleaned,
+                speed=speed,
+                label=label + " (cleaned)",
+                depth=depth,
+            )
+
+        # 3) Recursive split
         can_retry_split = (
             is_tensor_mismatch
             and depth < F5_RETRY_SPLIT_MAX_DEPTH
